@@ -4,7 +4,7 @@ from discord import option
 import re
 import logging
 from db.connection import database
-from db.actions import get_user_channel, create_user_channel, delete_user_channel
+from db.actions import get_user_channel, create_user_channel, delete_user_channel, get_welcome_message, set_welcome_message
 
 class ChannelManagement(commands.Cog):
     channels = discord.SlashCommandGroup("channel", "Personal channel management")
@@ -195,6 +195,91 @@ class ChannelManagement(commands.Cog):
         except Exception as e:
             logging.error(f"Unexpected error setting channel for user {user.id} in guild {guild.id}: {str(e)}")
             await ctx.respond("An unexpected error occurred. Please try again later.", ephemeral=True)
+
+    @channels.command(description="[Admin] Set the welcome message for new members")
+    @discord.default_permissions(administrator=True)
+    @option("message", description="Welcome message template. Use {name} for username, {channel} for their channel")
+    async def welcome(self, ctx, message: str):
+        guild = ctx.guild
+        if not guild:
+            await ctx.respond("This command can only be used in a server.", ephemeral=True)
+            return
+
+        try:
+            await set_welcome_message(guild.id, message, guild.name)
+
+            # Show a preview with example substitutions
+            preview = message.replace("{name}", ctx.author.mention).replace("{channel}", "#example-channel")
+            await ctx.respond(
+                f"Welcome message updated!\n\n**Preview:**\n{preview}",
+                ephemeral=True
+            )
+        except Exception as e:
+            logging.error(f"Unexpected error setting welcome message in guild {guild.id}: {str(e)}")
+            await ctx.respond("An unexpected error occurred. Please try again later.", ephemeral=True)
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        """Create a personal channel for new members and send welcome message."""
+        # Ignore bots
+        if member.bot:
+            return
+
+        guild = member.guild
+
+        try:
+            # Check if user already has a personal channel
+            existing_channel_id = await get_user_channel(guild.id, member.id)
+            if existing_channel_id:
+                existing_channel = guild.get_channel(existing_channel_id)
+                if existing_channel:
+                    return
+                # Channel was deleted but record still exists - clear the database entry
+                await delete_user_channel(guild.id, member.id)
+
+            # Find or create the "Personal Channels" category
+            category = discord.utils.get(guild.categories, name="Personal Channels")
+            if not category:
+                category = await guild.create_category("Personal Channels")
+
+            # Generate channel name with fallback
+            base_name = member.name.lower().replace(" ", "-")
+            # Clean the name to only include valid characters
+            base_name = re.sub(r'[^a-z0-9_-]', '', base_name)
+            if not base_name:
+                base_name = f"user-{member.id}"
+
+            channel_name = base_name
+            suffix = 1
+            while discord.utils.get(guild.channels, name=channel_name, category=category):
+                channel_name = f"{base_name}-{suffix}"
+                suffix += 1
+
+            # Create the channel
+            channel = await guild.create_text_channel(channel_name, category=category)
+
+            # Store the channel in the database
+            await create_user_channel(
+                guild_id=guild.id,
+                user_id=member.id,
+                channel_id=channel.id,
+                username=str(member),
+                guild_name=guild.name
+            )
+
+            # Send welcome message if configured
+            welcome_template = await get_welcome_message(guild.id)
+            if welcome_template:
+                welcome_msg = welcome_template.replace("{name}", member.mention).replace("{channel}", channel.mention)
+                await channel.send(welcome_msg)
+
+        except discord.Forbidden:
+            logging.error(f"Missing permissions to create channel for {member.id} in guild {guild.id}")
+        except discord.HTTPException as e:
+            error_msg = e.text if hasattr(e, 'text') else str(e)
+            logging.error(f"Failed to create channel for new member {member.id} in guild {guild.id}: {error_msg}")
+        except Exception as e:
+            logging.error(f"Unexpected error creating channel for new member {member.id} in guild {guild.id}: {str(e)}")
 
     def __init__(self, bot):
         self.bot = bot

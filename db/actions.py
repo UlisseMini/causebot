@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine
 from datetime import datetime, timedelta
 from db.connection import database, DATABASE_URL
-from db.schema import users, guilds, user_private_channels, user_xp, message_logs, metadata
+from db.schema import users, guilds, user_private_channels, user_xp, message_logs, guild_settings, metadata
 
 
 async def get_user_channel(guild_id: int, user_id: int):
@@ -191,6 +191,45 @@ async def get_user_xp(guild_id: int, user_id: int, days: int = 3) -> float:
     all_messages = await database.fetch_all(query)
     total_xp = round(sum(float(msg["xp_awarded"]) for msg in all_messages), 3)
     return total_xp
+
+
+async def get_welcome_message(guild_id: int) -> str | None:
+    """Get the welcome message template for a guild.
+    Returns the message template if set, None otherwise."""
+    query = guild_settings.select().where(guild_settings.c.guild_id == guild_id)
+    result = await database.fetch_one(query)
+    return result["welcome_message"] if result else None
+
+
+async def set_welcome_message(guild_id: int, message: str, guild_name: str = None):
+    """Set the welcome message template for a guild."""
+    # Ensure guild exists
+    guild_query = guilds.select().where(guilds.c.guild_id == guild_id)
+    guild_exists = await database.fetch_one(guild_query)
+    if not guild_exists:
+        await database.execute(
+            guilds.insert().values(guild_id=guild_id, name=guild_name)
+        )
+
+    # Check if guild_settings record already exists
+    settings_query = guild_settings.select().where(guild_settings.c.guild_id == guild_id)
+    existing_record = await database.fetch_one(settings_query)
+
+    if existing_record:
+        # Update existing record
+        await database.execute(
+            guild_settings.update().where(
+                guild_settings.c.guild_id == guild_id
+            ).values(welcome_message=message)
+        )
+    else:
+        # Create new record
+        await database.execute(
+            guild_settings.insert().values(
+                guild_id=guild_id,
+                welcome_message=message
+            )
+        )
 
 
 async def init_database():

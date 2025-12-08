@@ -45,3 +45,10 @@ message_logs = Table(
     Column("timestamp", String, nullable=False),
     Column("xp_awarded", Numeric(10, 3), nullable=False)
 )
+
+guild_settings = Table(
+    "guild_settings",
+    metadata,
+    Column("guild_id", BigInteger, ForeignKey("guilds.guild_id"), primary_key=True),
+    Column("welcome_message", String, nullable=True)
+)

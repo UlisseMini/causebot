@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 # Create bot instance with intents
 intents = discord.Intents.default()
 intents.message_content = True  # Required to read message content for XP system
+intents.members = True  # Required to receive member join events
 bot = discord.Bot(intents=intents)
 
 
@@ -71,6 +72,10 @@ async def main():
     # Initialize database (create tables if they don't exist)
     from db.actions import init_database
     await init_database()
+
+    # Run migrations
+    from db.migrations import run_migrations
+    run_migrations()
     print("Database initialized")
 
     # Connect to the database
