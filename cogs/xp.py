@@ -55,6 +55,18 @@ class XP(commands.Cog):
         if personal_channel_id and message.channel.id == personal_channel_id:
             # Update last journal message timestamp
             await update_last_journal_message(guild_id, user_id)
+
+            # Give them the active role immediately
+            from cogs.roles import get_or_create_active_role
+            import logging
+            role = await get_or_create_active_role(message.guild)
+            if role and role not in message.author.roles:
+                try:
+                    await message.author.add_roles(role, reason="Posted in personal channel")
+                except discord.Forbidden:
+                    logging.error(f"Missing permissions to manage roles for user {user_id} in guild {guild_id}")
+                except discord.HTTPException as e:
+                    logging.error(f"Failed to add role to user {user_id} in guild {guild_id}: {str(e)}")
     
     xp = discord.SlashCommandGroup("xp", "XP (experience points) management")
     @xp.command(description="View your XP statistics")
