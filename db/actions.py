@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine
 from datetime import datetime, timedelta
 from db.connection import database, DATABASE_URL
-from db.schema import users, guilds, user_private_channels, user_xp, message_logs, guild_settings, metadata
+from db.schema import users, guilds, user_private_channels, user_xp, message_logs, guild_settings, reminders, metadata
 
 
 async def get_user_channel(guild_id: int, user_id: int):
@@ -290,6 +290,37 @@ async def set_active_role_id(guild_id: int, role_id: int, guild_name: str = None
                 active_role_id=role_id
             )
         )
+
+
+async def create_reminder(guild_id: int, user_id: int, channel_id: int, message_link: str, message_preview: str | None, remind_at: datetime):
+    """Create a new reminder."""
+    await database.execute(
+        reminders.insert().values(
+            guild_id=guild_id,
+            user_id=user_id,
+            channel_id=channel_id,
+            message_link=message_link,
+            message_preview=message_preview,
+            remind_at=remind_at.isoformat(),
+        )
+    )
+
+
+async def get_due_reminders():
+    """Get all reminders that are due and not yet completed."""
+    now = datetime.utcnow().isoformat()
+    query = reminders.select().where(
+        (reminders.c.remind_at <= now) &
+        (reminders.c.completed == 0)
+    )
+    return await database.fetch_all(query)
+
+
+async def mark_reminder_completed(reminder_id: int):
+    """Mark a reminder as completed."""
+    await database.execute(
+        reminders.update().where(reminders.c.id == reminder_id).values(completed=1)
+    )
 
 
 async def init_database():

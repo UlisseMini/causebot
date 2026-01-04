@@ -54,3 +54,17 @@ guild_settings = Table(
     Column("welcome_message", String, nullable=True),
     Column("active_role_id", BigInteger, nullable=True)
 )
+
+reminders = Table(
+    "reminders",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("guild_id", BigInteger, nullable=False),
+    Column("user_id", BigInteger, nullable=False),
+    Column("channel_id", BigInteger, nullable=False),
+    Column("message_link", String, nullable=False),
+    Column("message_preview", String, nullable=True),
+    Column("remind_at", String, nullable=False),
+    Column("created_at", String, server_default=func.now()),
+    Column("completed", Integer, server_default="0")
+)

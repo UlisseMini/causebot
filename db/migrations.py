@@ -33,10 +33,28 @@ def migration_003_add_active_role_id(conn):
         conn.execute(text("ALTER TABLE guild_settings ADD COLUMN active_role_id BIGINT"))
 
 
+def migration_004_create_reminders(conn):
+    """Create reminders table."""
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            channel_id BIGINT NOT NULL,
+            message_link TEXT NOT NULL,
+            message_preview TEXT,
+            remind_at TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            completed INTEGER DEFAULT 0
+        )
+    """))
+
+
 MIGRATIONS = [
     ("001_create_guild_settings", migration_001_create_guild_settings),
     ("002_add_last_journal_message", migration_002_add_last_journal_message),
     ("003_add_active_role_id", migration_003_add_active_role_id),
+    ("004_create_reminders", migration_004_create_reminders),
 ]
 
 
