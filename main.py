@@ -13,7 +13,8 @@ bot = discord.Bot(intents=intents)
 @bot.event
 async def on_ready():
     """Called when the bot successfully connects to Discord"""
-    print(f"Bot is online as {bot.user}")
+    await bot.sync_commands()
+    print(f"Bot is online as {bot.user} (commands synced)")
 
 
 @bot.slash_command(name="ping", description="Check bot latency and response times")
