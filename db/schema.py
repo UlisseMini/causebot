@@ -68,3 +68,29 @@ reminders = Table(
     Column("created_at", String, server_default=func.now()),
     Column("completed", Integer, server_default="0")
 )
+
+one_on_one_pool = Table(
+    "one_on_one_pool",
+    metadata,
+    Column("guild_id", BigInteger, primary_key=True),
+    Column("user_id", BigInteger, primary_key=True),
+    Column("joined_at", String, server_default=func.now()),
+    Column("skip_until", String, nullable=True),
+    Column("sat_out_at", String, nullable=True)
+)
+
+one_on_one_matches = Table(
+    "one_on_one_matches",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("guild_id", BigInteger, nullable=False),
+    Column("week_start", String, nullable=False),
+    Column("user1_id", BigInteger, nullable=False),
+    Column("user2_id", BigInteger, nullable=False),
+    Column("thread_id", BigInteger, nullable=True),
+    Column("user1_status", String, server_default="pending"),
+    Column("user2_status", String, server_default="pending"),
+    Column("reminder_count", Integer, server_default="0"),
+    Column("created_at", String, server_default=func.now()),
+    Column("completed_at", String, nullable=True)
+)

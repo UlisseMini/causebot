@@ -50,11 +50,46 @@ def migration_004_create_reminders(conn):
     """))
 
 
+def migration_005_create_one_on_one_pool(conn):
+    """Create one_on_one_pool table for users who opt into weekly 1-1 matching."""
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS one_on_one_pool (
+            guild_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            joined_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            skip_until TEXT,
+            sat_out_at TEXT,
+            PRIMARY KEY (guild_id, user_id)
+        )
+    """))
+
+
+def migration_006_create_one_on_one_matches(conn):
+    """Create one_on_one_matches table for tracking weekly pairings."""
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS one_on_one_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id BIGINT NOT NULL,
+            week_start TEXT NOT NULL,
+            user1_id BIGINT NOT NULL,
+            user2_id BIGINT NOT NULL,
+            thread_id BIGINT,
+            user1_status TEXT DEFAULT 'pending',
+            user2_status TEXT DEFAULT 'pending',
+            reminder_count INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            completed_at TEXT
+        )
+    """))
+
+
 MIGRATIONS = [
     ("001_create_guild_settings", migration_001_create_guild_settings),
     ("002_add_last_journal_message", migration_002_add_last_journal_message),
     ("003_add_active_role_id", migration_003_add_active_role_id),
     ("004_create_reminders", migration_004_create_reminders),
+    ("005_create_one_on_one_pool", migration_005_create_one_on_one_pool),
+    ("006_create_one_on_one_matches", migration_006_create_one_on_one_matches),
 ]
 
 

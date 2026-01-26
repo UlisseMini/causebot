@@ -96,6 +96,7 @@ async def main():
         bot.load_extension("cogs.roles")
         bot.load_extension("cogs.reminders")
         bot.load_extension("cogs.claude")
+        bot.load_extension("cogs.one_on_ones")
         print("Cogs loaded")
 
         # Start the bot
