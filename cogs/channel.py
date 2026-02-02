@@ -190,33 +190,16 @@ class ChannelManagement(commands.Cog):
             return
 
         try:
-            # Check if the user already has a personal channel
+            # Check if the user already has a different personal channel - delete the old mapping
             existing_channel_id = await get_user_channel(guild.id, user.id)
-            if existing_channel_id:
-                existing_channel = guild.get_channel(existing_channel_id)
-                if existing_channel:
-                    await ctx.respond(
-                        f"{user.mention} already has a personal channel: {existing_channel.mention}\n"
-                        f"Please delete their existing channel first before assigning a new one.",
-                        ephemeral=True
-                    )
-                    return
-                # Channel was deleted but record still exists - clear the database entry
+            if existing_channel_id and existing_channel_id != channel.id:
                 await delete_user_channel(guild.id, user.id)
 
-            # Check if the channel is already assigned to someone else
+            # Check if the channel is already assigned to someone else - reassign it
             query = "SELECT user_id FROM user_private_channels WHERE guild_id = :guild_id AND channel_id = :channel_id"
             result = await database.fetch_one(query=query, values={"guild_id": guild.id, "channel_id": channel.id})
-            if result:
-                other_user_id = result["user_id"]
-                other_user = guild.get_member(other_user_id)
-                user_mention = other_user.mention if other_user else f"User ID {other_user_id}"
-                await ctx.respond(
-                    f"{channel.mention} is already assigned to {user_mention}\n"
-                    f"Please unassign it first or choose a different channel.",
-                    ephemeral=True
-                )
-                return
+            if result and result["user_id"] != user.id:
+                await delete_user_channel(guild.id, result["user_id"])
 
             # Give the user manage_permissions so they can control who views their channel
             await _set_channel_owner_permissions(channel, user)
