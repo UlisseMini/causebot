@@ -1,10 +1,19 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import option
 import re
 import logging
 from db.connection import database
-from db.actions import get_user_channel, create_user_channel, delete_user_channel, get_welcome_message, set_welcome_message
+from db.actions import get_user_channel, create_user_channel, delete_user_channel, get_welcome_message, set_welcome_message, get_all_user_channels
+
+async def _set_channel_owner_permissions(channel: discord.TextChannel, member: discord.Member):
+    """Give the channel owner manage_permissions so they can control who views their channel."""
+    await channel.set_permissions(
+        member,
+        manage_permissions=True,
+        reason=f"Personal channel owner permissions for {member}"
+    )
+
 
 def _generate_channel_name(member: discord.Member, category: discord.CategoryChannel) -> str:
     """Generate a unique channel name for a member.
@@ -103,7 +112,10 @@ class ChannelManagement(commands.Cog):
             
             # Create the channel
             channel = await guild.create_text_channel(name, category=category)
-            
+
+            # Give the user manage_permissions so they can control who views their channel
+            await _set_channel_owner_permissions(channel, ctx.author)
+
             # Store the channel in the database
             await create_user_channel(
                 guild_id=guild.id,
@@ -112,7 +124,7 @@ class ChannelManagement(commands.Cog):
                 username=str(ctx.author),
                 guild_name=guild.name
             )
-            
+
             await ctx.respond(f"Your personal channel is available at {channel.mention}", ephemeral=True)
         except discord.Forbidden:
             await ctx.respond("I don't have permission to create channels. Please check my permissions.", ephemeral=True)
@@ -205,6 +217,9 @@ class ChannelManagement(commands.Cog):
                     ephemeral=True
                 )
                 return
+
+            # Give the user manage_permissions so they can control who views their channel
+            await _set_channel_owner_permissions(channel, user)
 
             # Store the channel in the database
             await create_user_channel(
@@ -314,6 +329,9 @@ class ChannelManagement(commands.Cog):
             # Create the channel
             channel = await guild.create_text_channel(channel_name, category=category)
 
+            # Give the user manage_permissions so they can control who views their channel
+            await _set_channel_owner_permissions(channel, member)
+
             # Store the channel in the database
             await create_user_channel(
                 guild_id=guild.id,
@@ -350,8 +368,70 @@ class ChannelManagement(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-    
-    
+        self.sync_channel_permissions.start()
+
+    def cog_unload(self):
+        self.sync_channel_permissions.cancel()
+
+    @tasks.loop(hours=1)
+    async def sync_channel_permissions(self):
+        """Periodically sync permissions for all personal channels."""
+        for guild in self.bot.guilds:
+            try:
+                await self._sync_guild_channel_permissions(guild)
+            except Exception as e:
+                logging.error(f"Error syncing channel permissions for guild {guild.id}: {e}")
+
+    @sync_channel_permissions.before_loop
+    async def before_sync_channel_permissions(self):
+        await self.bot.wait_until_ready()
+
+    async def _sync_guild_channel_permissions(self, guild: discord.Guild):
+        """Sync permissions for all personal channels in a guild."""
+        user_channels = await get_all_user_channels(guild.id)
+        for mapping in user_channels:
+            user_id = mapping["user_id"]
+            channel_id = mapping["channel_id"]
+
+            channel = guild.get_channel(channel_id)
+            if not channel:
+                # Channel was deleted, clean up DB record
+                await delete_user_channel(guild.id, user_id)
+                continue
+
+            member = guild.get_member(user_id)
+            if not member:
+                # User left the server, skip (don't delete - they might rejoin)
+                continue
+
+            # Check if user already has manage_permissions
+            overwrites = channel.overwrites_for(member)
+            if overwrites.manage_permissions is not True:
+                try:
+                    await _set_channel_owner_permissions(channel, member)
+                    logging.info(f"Synced permissions for {member} on channel {channel.name}")
+                except discord.Forbidden:
+                    logging.error(f"Missing permissions to set channel perms for {member.id} in {guild.id}")
+                except discord.HTTPException as e:
+                    logging.error(f"Failed to set channel perms for {member.id} in {guild.id}: {e}")
+
+    @channels.command(description="[Admin] Sync permissions for all personal channels")
+    @discord.default_permissions(administrator=True)
+    async def sync_permissions(self, ctx):
+        """Manually trigger permission sync for all personal channels."""
+        guild = ctx.guild
+        if not guild:
+            await ctx.respond("This command can only be used in a server.", ephemeral=True)
+            return
+
+        await ctx.defer(ephemeral=True)
+        try:
+            await self._sync_guild_channel_permissions(guild)
+            await ctx.respond("Successfully synced permissions for all personal channels.", ephemeral=True)
+        except Exception as e:
+            logging.error(f"Error in manual permission sync for guild {guild.id}: {e}")
+            await ctx.respond("An error occurred while syncing permissions.", ephemeral=True)
+
 
 def setup(bot):
     bot.add_cog(ChannelManagement(bot))

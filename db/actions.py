@@ -547,3 +547,13 @@ async def get_user_partners_this_week(guild_id: int, user_id: int, week_start: s
             partners.add(row["user1_id"])
     return partners
 
+
+async def get_all_user_channels(guild_id: int) -> list[dict]:
+    """Get all user channel mappings for a guild.
+    Returns list of dicts with user_id and channel_id."""
+    query = user_private_channels.select().where(
+        user_private_channels.c.guild_id == guild_id
+    )
+    results = await database.fetch_all(query)
+    return [{"user_id": row["user_id"], "channel_id": row["channel_id"]} for row in results]
+
