@@ -52,7 +52,8 @@ guild_settings = Table(
     metadata,
     Column("guild_id", BigInteger, ForeignKey("guilds.guild_id"), primary_key=True),
     Column("welcome_message", String, nullable=True),
-    Column("active_role_id", BigInteger, nullable=True)
+    Column("active_role_id", BigInteger, nullable=True),
+    Column("active_days", Integer, nullable=True, default=3)
 )
 
 reminders = Table(

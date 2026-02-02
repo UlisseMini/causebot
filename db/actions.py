@@ -557,3 +557,41 @@ async def get_all_user_channels(guild_id: int) -> list[dict]:
     results = await database.fetch_all(query)
     return [{"user_id": row["user_id"], "channel_id": row["channel_id"]} for row in results]
 
+
+async def get_active_days(guild_id: int) -> int:
+    """Get the number of days of inactivity before losing the active role. Default 3."""
+    query = guild_settings.select().where(guild_settings.c.guild_id == guild_id)
+    result = await database.fetch_one(query)
+    if result and result["active_days"] is not None:
+        return result["active_days"]
+    return 3
+
+
+async def set_active_days(guild_id: int, days: int, guild_name: str = None):
+    """Set the number of days of inactivity before losing the active role."""
+    # Ensure guild exists
+    guild_query = guilds.select().where(guilds.c.guild_id == guild_id)
+    guild_exists = await database.fetch_one(guild_query)
+    if not guild_exists:
+        await database.execute(
+            guilds.insert().values(guild_id=guild_id, name=guild_name)
+        )
+
+    # Check if guild_settings record already exists
+    settings_query = guild_settings.select().where(guild_settings.c.guild_id == guild_id)
+    existing_record = await database.fetch_one(settings_query)
+
+    if existing_record:
+        await database.execute(
+            guild_settings.update().where(
+                guild_settings.c.guild_id == guild_id
+            ).values(active_days=days)
+        )
+    else:
+        await database.execute(
+            guild_settings.insert().values(
+                guild_id=guild_id,
+                active_days=days
+            )
+        )
+

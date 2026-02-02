@@ -2,7 +2,7 @@ import discord
 from discord.ext import commands
 import random
 from db.connection import database
-from db.actions import can_award_xp, award_xp, get_user_xp, get_user_channel, update_last_journal_message
+from db.actions import can_award_xp, award_xp, get_user_xp, get_user_channel
 
 
 class XP(commands.Cog):
@@ -50,13 +50,9 @@ class XP(commands.Cog):
             guild_name=guild_name
         )
 
-        # Check if this message is in the user's personal channel
+        # Check if this message is in the user's personal channel - give role immediately
         personal_channel_id = await get_user_channel(guild_id, user_id)
         if personal_channel_id and message.channel.id == personal_channel_id:
-            # Update last journal message timestamp
-            await update_last_journal_message(guild_id, user_id)
-
-            # Give them the active role immediately
             from cogs.roles import get_or_create_active_role
             import logging
             role = await get_or_create_active_role(message.guild)

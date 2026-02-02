@@ -83,6 +83,12 @@ def migration_006_create_one_on_one_matches(conn):
     """))
 
 
+def migration_007_add_active_days(conn):
+    """Add active_days column to guild_settings (default 3 days)."""
+    if not _column_exists(conn, "guild_settings", "active_days"):
+        conn.execute(text("ALTER TABLE guild_settings ADD COLUMN active_days INTEGER DEFAULT 3"))
+
+
 MIGRATIONS = [
     ("001_create_guild_settings", migration_001_create_guild_settings),
     ("002_add_last_journal_message", migration_002_add_last_journal_message),
@@ -90,6 +96,7 @@ MIGRATIONS = [
     ("004_create_reminders", migration_004_create_reminders),
     ("005_create_one_on_one_pool", migration_005_create_one_on_one_pool),
     ("006_create_one_on_one_matches", migration_006_create_one_on_one_matches),
+    ("007_add_active_days", migration_007_add_active_days),
 ]
 
 
