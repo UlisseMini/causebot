@@ -435,7 +435,7 @@ class ChannelManagement(commands.Cog):
     @channels.command(description="[Admin] Discover and link unlinked personal channels")
     @discord.default_permissions(administrator=True)
     async def discover(self, ctx):
-        """Find channels in Personal Channels category that aren't linked to users and try to match them."""
+        """Find channels in Personal Channels category that aren't linked to users and try to match them using Claude AI."""
         guild = ctx.guild
         if not guild:
             await ctx.respond("This command can only be used in a server.", ephemeral=True)
@@ -451,6 +451,7 @@ class ChannelManagement(commands.Cog):
         # Get all currently linked channel IDs
         linked_channels = await get_all_user_channels(guild.id)
         linked_channel_ids = {m["channel_id"] for m in linked_channels}
+        users_with_channels = {m["user_id"] for m in linked_channels}
 
         # Find unlinked channels
         unlinked = [ch for ch in category.channels if isinstance(ch, discord.TextChannel) and ch.id not in linked_channel_ids]
@@ -459,87 +460,146 @@ class ChannelManagement(commands.Cog):
             await ctx.respond("All channels in Personal Channels are already linked.", ephemeral=True)
             return
 
-        # Try to match channels to members by name
-        matched = []
-        unmatched = []
+        # Get members without channels
+        available_members = [m for m in guild.members if not m.bot and m.id not in users_with_channels]
 
-        for channel in unlinked:
-            # Try to find a member whose name matches the channel
-            channel_name = channel.name.lower().replace("-", " ").replace("_", " ")
-            found_member = None
-
-            for member in guild.members:
-                if member.bot:
-                    continue
-                display_clean = member.display_name.lower().replace("-", " ").replace("_", " ")
-                name_clean = member.name.lower().replace("-", " ").replace("_", " ")
-
-                # Check various matching strategies
-                if (channel_name == display_clean or
-                    channel_name == name_clean or
-                    channel.name.lower() == member.display_name.lower().replace(" ", "-") or
-                    channel.name.lower() == member.name.lower().replace(" ", "-")):
-                    found_member = member
-                    break
-
-            if found_member:
-                # Check if this user already has a channel
-                existing = await get_user_channel(guild.id, found_member.id)
-                if existing:
-                    unmatched.append(f"{channel.mention} - matches {found_member.mention} but they already have a channel")
-                else:
-                    matched.append((channel, found_member))
-            else:
-                unmatched.append(f"{channel.mention} - no matching member found")
-
-        # Build response
-        lines = []
-        if matched:
-            lines.append(f"**Found {len(matched)} matches to link:**")
-            for ch, member in matched:
-                lines.append(f"• {ch.mention} → {member.mention}")
-            lines.append("")
-            lines.append("Reply with `yes` to link these, or `no` to cancel.")
-
-        if unmatched:
-            lines.append(f"**{len(unmatched)} unmatched channels:**")
-            for desc in unmatched[:10]:  # Limit to avoid message too long
-                lines.append(f"• {desc}")
-            if len(unmatched) > 10:
-                lines.append(f"• ... and {len(unmatched) - 10} more")
-
-        if not matched:
-            await ctx.respond("\n".join(lines), ephemeral=True)
+        if not available_members:
+            await ctx.respond(f"Found {len(unlinked)} unlinked channels but all members already have channels assigned.", ephemeral=True)
             return
 
-        await ctx.respond("\n".join(lines), ephemeral=True)
+        # Use Claude to match channels to members
+        from cogs.claude import get_client
+        client = get_client()
+        if not client:
+            await ctx.followup.send("Claude AI not configured. Set ANTHROPIC_API_KEY to use smart matching.", ephemeral=True)
+            return
 
-        # Wait for confirmation
-        def check(m):
-            return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ("yes", "no")
+        # Build the prompt
+        channels_list = "\n".join([f"- {ch.name}" for ch in unlinked])
+        members_list = "\n".join([f"- {m.display_name} (username: {m.name})" for m in available_members])
+
+        prompt = f"""Match these Discord channel names to member names. Channels are typically named after the person who owns them (with spaces replaced by hyphens).
+
+UNLINKED CHANNELS:
+{channels_list}
+
+AVAILABLE MEMBERS (display name + username):
+{members_list}
+
+Return ONLY a JSON array of matches. Each match should be:
+{{"channel": "channel-name", "member_username": "username", "confidence": "high" or "medium"}}
+
+Only include matches you're reasonably confident about. Use "high" for exact/obvious matches, "medium" for likely but not certain matches. Omit channels you can't match.
+
+Return valid JSON only, no explanation."""
 
         try:
-            msg = await self.bot.wait_for("message", check=check, timeout=60)
-            if msg.content.lower() == "yes":
-                linked_count = 0
-                for channel, member in matched:
-                    try:
-                        await _set_channel_owner_permissions(channel, member)
-                        await create_user_channel(
-                            guild_id=guild.id,
-                            user_id=member.id,
-                            channel_id=channel.id,
-                            username=str(member),
-                            guild_name=guild.name
-                        )
-                        linked_count += 1
-                    except Exception as e:
-                        logging.error(f"Failed to link {channel.name} to {member}: {e}")
-                await ctx.followup.send(f"Linked {linked_count} channels.", ephemeral=True)
-            else:
-                await ctx.followup.send("Cancelled.", ephemeral=True)
-        except TimeoutError:
-            await ctx.followup.send("Timed out waiting for confirmation.", ephemeral=True)
+            response = client.messages.create(
+                max_tokens=2000,
+                messages=[{"role": "user", "content": prompt}],
+                model="claude-sonnet-4-5",
+            )
+            response_text = response.content[0].text.strip()
+
+            # Parse JSON response
+            import json
+            # Handle markdown code blocks
+            if response_text.startswith("```"):
+                response_text = response_text.split("```")[1]
+                if response_text.startswith("json"):
+                    response_text = response_text[4:]
+            matches_data = json.loads(response_text)
+
+        except Exception as e:
+            logging.error(f"Claude matching failed: {e}")
+            await ctx.followup.send(f"Claude matching failed: {e}", ephemeral=True)
+            return
+
+        # Convert to actual objects
+        matched = []
+        channel_map = {ch.name: ch for ch in unlinked}
+        member_map = {m.name: m for m in available_members}
+
+        for match in matches_data:
+            ch_name = match.get("channel")
+            member_username = match.get("member_username")
+            confidence = match.get("confidence", "medium")
+
+            channel = channel_map.get(ch_name)
+            member = member_map.get(member_username)
+
+            if channel and member:
+                matched.append((channel, member, confidence))
+
+        if not matched:
+            await ctx.followup.send("Claude couldn't find any confident matches.", ephemeral=True)
+            return
+
+        # Build response with buttons
+        lines = [f"**Found {len(matched)} matches:**"]
+        for ch, member, conf in matched:
+            conf_emoji = "✓" if conf == "high" else "?"
+            lines.append(f"{conf_emoji} {ch.mention} → {member.mention}")
+
+        unmatched_channels = [ch for ch in unlinked if ch not in [m[0] for m in matched]]
+        if unmatched_channels:
+            lines.append(f"\n**{len(unmatched_channels)} channels couldn't be matched:**")
+            for ch in unmatched_channels[:5]:
+                lines.append(f"• {ch.mention}")
+            if len(unmatched_channels) > 5:
+                lines.append(f"• ... and {len(unmatched_channels) - 5} more")
+
+        # Create confirmation view with buttons
+        view = DiscoverConfirmView(matched, guild, ctx.author.id)
+        await ctx.followup.send("\n".join(lines), view=view, ephemeral=True)
+
+
+class DiscoverConfirmView(discord.ui.View):
+    def __init__(self, matched: list, guild: discord.Guild, author_id: int):
+        super().__init__(timeout=120)
+        self.matched = matched  # list of (channel, member, confidence)
+        self.guild = guild
+        self.author_id = author_id
+
+    @discord.ui.button(label="Link All", style=discord.ButtonStyle.green)
+    async def confirm(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the command invoker can confirm.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        linked_count = 0
+        for channel, member, _ in self.matched:
+            try:
+                await _set_channel_owner_permissions(channel, member)
+                await create_user_channel(
+                    guild_id=self.guild.id,
+                    user_id=member.id,
+                    channel_id=channel.id,
+                    username=str(member),
+                    guild_name=self.guild.name
+                )
+                linked_count += 1
+            except Exception as e:
+                logging.error(f"Failed to link {channel.name} to {member}: {e}")
+
+        self.disable_all_items()
+        await interaction.edit_original_response(content=f"Linked {linked_count} channels.", view=self)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+    async def cancel(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the command invoker can cancel.", ephemeral=True)
+            return
+
+        self.disable_all_items()
+        await interaction.response.edit_message(content="Cancelled.", view=self)
+        self.stop()
+
+    def disable_all_items(self):
+        for item in self.children:
+            item.disabled = True
 
 
 def setup(bot):
