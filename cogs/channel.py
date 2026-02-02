@@ -351,23 +351,79 @@ class ChannelManagement(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-        self.sync_channel_permissions.start()
+        self.sync_channels_task.start()
 
     def cog_unload(self):
-        self.sync_channel_permissions.cancel()
+        self.sync_channels_task.cancel()
 
     @tasks.loop(hours=1)
-    async def sync_channel_permissions(self):
-        """Periodically sync permissions for all personal channels."""
+    async def sync_channels_task(self):
+        """Periodically sync channels: create missing ones and fix permissions."""
         for guild in self.bot.guilds:
             try:
+                await self._ensure_all_members_have_channels(guild)
                 await self._sync_guild_channel_permissions(guild)
             except Exception as e:
-                logging.error(f"Error syncing channel permissions for guild {guild.id}: {e}")
+                logging.error(f"Error syncing channels for guild {guild.id}: {e}")
 
-    @sync_channel_permissions.before_loop
-    async def before_sync_channel_permissions(self):
+    @sync_channels_task.before_loop
+    async def before_sync_channels_task(self):
         await self.bot.wait_until_ready()
+
+    async def _ensure_all_members_have_channels(self, guild: discord.Guild) -> int:
+        """Create personal channels for any members who don't have one. Returns count created."""
+        # Get existing channel mappings
+        user_channels = await get_all_user_channels(guild.id)
+        users_with_channels = {uc["user_id"] for uc in user_channels}
+
+        # Find or create the category
+        category = discord.utils.get(guild.categories, name="Personal Channels")
+        if not category:
+            try:
+                category = await guild.create_category("Personal Channels")
+            except discord.Forbidden:
+                logging.error(f"Missing permissions to create category in guild {guild.id}")
+                return 0
+
+        created = 0
+        for member in guild.members:
+            if member.bot:
+                continue
+            if member.id in users_with_channels:
+                continue
+
+            try:
+                # Generate channel name and create
+                channel_name = _generate_channel_name(member, category)
+                channel = await guild.create_text_channel(channel_name, category=category)
+
+                # Set permissions
+                await _set_channel_owner_permissions(channel, member)
+
+                # Store in DB
+                await create_user_channel(
+                    guild_id=guild.id,
+                    user_id=member.id,
+                    channel_id=channel.id,
+                    username=str(member),
+                    guild_name=guild.name
+                )
+
+                # Send welcome message if configured
+                welcome_template = await get_welcome_message(guild.id)
+                if welcome_template:
+                    welcome_msg = welcome_template.replace("{name}", member.mention).replace("{channel}", channel.mention)
+                    await channel.send(welcome_msg)
+
+                created += 1
+                logging.info(f"Created channel {channel.name} for {member} in {guild.name}")
+
+            except discord.Forbidden:
+                logging.error(f"Missing permissions to create channel for {member.id} in guild {guild.id}")
+            except discord.HTTPException as e:
+                logging.error(f"Failed to create channel for {member.id} in guild {guild.id}: {e}")
+
+        return created
 
     async def _sync_guild_channel_permissions(self, guild: discord.Guild):
         """Sync permissions for all personal channels in a guild."""
@@ -414,6 +470,26 @@ class ChannelManagement(commands.Cog):
         except Exception as e:
             logging.error(f"Error in manual permission sync for guild {guild.id}: {e}")
             await ctx.respond("An error occurred while syncing permissions.", ephemeral=True)
+
+    @channels.command(description="[Admin] Create personal channels for all members who don't have one")
+    @discord.default_permissions(administrator=True)
+    async def create_all(self, ctx):
+        """Create personal channels for any members missing them."""
+        guild = ctx.guild
+        if not guild:
+            await ctx.respond("This command can only be used in a server.", ephemeral=True)
+            return
+
+        await ctx.defer(ephemeral=True)
+        try:
+            created = await self._ensure_all_members_have_channels(guild)
+            if created > 0:
+                await ctx.respond(f"Created {created} personal channels.", ephemeral=True)
+            else:
+                await ctx.respond("All members already have personal channels.", ephemeral=True)
+        except Exception as e:
+            logging.error(f"Error creating channels for guild {guild.id}: {e}")
+            await ctx.respond("An error occurred while creating channels.", ephemeral=True)
 
     @channels.command(description="[Admin] Discover and link unlinked personal channels")
     @discord.default_permissions(administrator=True)
