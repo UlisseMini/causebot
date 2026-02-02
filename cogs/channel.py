@@ -432,6 +432,115 @@ class ChannelManagement(commands.Cog):
             logging.error(f"Error in manual permission sync for guild {guild.id}: {e}")
             await ctx.respond("An error occurred while syncing permissions.", ephemeral=True)
 
+    @channels.command(description="[Admin] Discover and link unlinked personal channels")
+    @discord.default_permissions(administrator=True)
+    async def discover(self, ctx):
+        """Find channels in Personal Channels category that aren't linked to users and try to match them."""
+        guild = ctx.guild
+        if not guild:
+            await ctx.respond("This command can only be used in a server.", ephemeral=True)
+            return
+
+        await ctx.defer(ephemeral=True)
+
+        category = discord.utils.get(guild.categories, name="Personal Channels")
+        if not category:
+            await ctx.respond("No 'Personal Channels' category found.", ephemeral=True)
+            return
+
+        # Get all currently linked channel IDs
+        linked_channels = await get_all_user_channels(guild.id)
+        linked_channel_ids = {m["channel_id"] for m in linked_channels}
+
+        # Find unlinked channels
+        unlinked = [ch for ch in category.channels if isinstance(ch, discord.TextChannel) and ch.id not in linked_channel_ids]
+
+        if not unlinked:
+            await ctx.respond("All channels in Personal Channels are already linked.", ephemeral=True)
+            return
+
+        # Try to match channels to members by name
+        matched = []
+        unmatched = []
+
+        for channel in unlinked:
+            # Try to find a member whose name matches the channel
+            channel_name = channel.name.lower().replace("-", " ").replace("_", " ")
+            found_member = None
+
+            for member in guild.members:
+                if member.bot:
+                    continue
+                display_clean = member.display_name.lower().replace("-", " ").replace("_", " ")
+                name_clean = member.name.lower().replace("-", " ").replace("_", " ")
+
+                # Check various matching strategies
+                if (channel_name == display_clean or
+                    channel_name == name_clean or
+                    channel.name.lower() == member.display_name.lower().replace(" ", "-") or
+                    channel.name.lower() == member.name.lower().replace(" ", "-")):
+                    found_member = member
+                    break
+
+            if found_member:
+                # Check if this user already has a channel
+                existing = await get_user_channel(guild.id, found_member.id)
+                if existing:
+                    unmatched.append(f"{channel.mention} - matches {found_member.mention} but they already have a channel")
+                else:
+                    matched.append((channel, found_member))
+            else:
+                unmatched.append(f"{channel.mention} - no matching member found")
+
+        # Build response
+        lines = []
+        if matched:
+            lines.append(f"**Found {len(matched)} matches to link:**")
+            for ch, member in matched:
+                lines.append(f"• {ch.mention} → {member.mention}")
+            lines.append("")
+            lines.append("Reply with `yes` to link these, or `no` to cancel.")
+
+        if unmatched:
+            lines.append(f"**{len(unmatched)} unmatched channels:**")
+            for desc in unmatched[:10]:  # Limit to avoid message too long
+                lines.append(f"• {desc}")
+            if len(unmatched) > 10:
+                lines.append(f"• ... and {len(unmatched) - 10} more")
+
+        if not matched:
+            await ctx.respond("\n".join(lines), ephemeral=True)
+            return
+
+        await ctx.respond("\n".join(lines), ephemeral=True)
+
+        # Wait for confirmation
+        def check(m):
+            return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ("yes", "no")
+
+        try:
+            msg = await self.bot.wait_for("message", check=check, timeout=60)
+            if msg.content.lower() == "yes":
+                linked_count = 0
+                for channel, member in matched:
+                    try:
+                        await _set_channel_owner_permissions(channel, member)
+                        await create_user_channel(
+                            guild_id=guild.id,
+                            user_id=member.id,
+                            channel_id=channel.id,
+                            username=str(member),
+                            guild_name=guild.name
+                        )
+                        linked_count += 1
+                    except Exception as e:
+                        logging.error(f"Failed to link {channel.name} to {member}: {e}")
+                await ctx.followup.send(f"Linked {linked_count} channels.", ephemeral=True)
+            else:
+                await ctx.followup.send("Cancelled.", ephemeral=True)
+        except TimeoutError:
+            await ctx.followup.send("Timed out waiting for confirmation.", ephemeral=True)
+
 
 def setup(bot):
     bot.add_cog(ChannelManagement(bot))
