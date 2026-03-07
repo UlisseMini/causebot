@@ -142,16 +142,19 @@ async def read_text_attachment(attachment: discord.Attachment) -> str | None:
 # --- Cost estimation ---
 
 MODEL_PRICING = {
-    "claude-opus-4-6": {"input": 15.0, "output": 75.0},
-    "claude-sonnet-4-5": {"input": 3.0, "output": 15.0},
-    "claude-haiku-4-5": {"input": 0.80, "output": 4.0},
+    "claude-opus-4-6": {"input": 5.0, "output": 25.0},
+    "claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
+    "claude-haiku-4-5": {"input": 1.0, "output": 5.0},
 }
 
 MODEL_ALIASES = {
     "opus": "claude-opus-4-6",
-    "sonnet": "claude-sonnet-4-5",
+    "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5",
 }
+
+# Max input tokens per scan call (leave room for instructions + output)
+SCAN_MAX_INPUT_TOKENS = 150_000
 
 
 def estimate_tokens(text: str) -> int:
@@ -159,31 +162,25 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
-def estimate_scan_cost(total_chars: int, model: str, batch_size: int = 100) -> dict:
-    """Estimate cost for a full scan. Returns dict with details."""
+def estimate_scan_cost(total_input_tokens: int, num_batches: int, model: str) -> dict:
+    """Estimate cost for a scan given actual token counts."""
     model_id = MODEL_ALIASES.get(model, model)
-    pricing = MODEL_PRICING.get(model_id, MODEL_PRICING["claude-sonnet-4-5"])
+    pricing = MODEL_PRICING.get(model_id, MODEL_PRICING["claude-sonnet-4-6"])
 
-    total_tokens = total_chars // 4
-    # Each batch sends: instructions + memory (~2k tokens) + batch messages
-    # Rough: each token is processed once as input, output is ~500 tokens per batch
-    avg_batch_input = total_tokens // max(1, total_chars // (batch_size * 500)) + 2000
-    num_batches = max(1, total_tokens // (batch_size * 125))  # ~125 tokens per message avg
-    total_input = total_tokens + (num_batches * 2000)  # overhead per batch
-    total_output = num_batches * 500  # ~500 tokens output per batch
+    # Output: ~2000 tokens per batch (memory update)
+    total_output = num_batches * 2000
 
-    input_cost = (total_input / 1_000_000) * pricing["input"]
+    input_cost = (total_input_tokens / 1_000_000) * pricing["input"]
     output_cost = (total_output / 1_000_000) * pricing["output"]
 
     return {
         "model": model_id,
-        "total_messages": 0,  # filled by caller
-        "total_chars": total_chars,
-        "estimated_tokens": total_tokens,
+        "estimated_input_tokens": total_input_tokens,
+        "estimated_output_tokens": total_output,
         "num_batches": num_batches,
-        "input_cost": round(input_cost, 2),
-        "output_cost": round(output_cost, 2),
-        "total_cost": round(input_cost + output_cost, 2),
+        "input_cost": round(input_cost, 4),
+        "output_cost": round(output_cost, 4),
+        "total_cost": round(input_cost + output_cost, 4),
     }
 
 
@@ -464,24 +461,50 @@ def _make_progress_bar(current: int, total: int, width: int = 16) -> str:
     return f"[{bar}]"
 
 
+def _build_scan_batches(messages: list[dict], max_tokens: int = SCAN_MAX_INPUT_TOKENS,
+                         overhead_tokens: int = 3000) -> list[list[dict]]:
+    """Split messages into batches that fit within max_tokens (based on actual text length).
+    overhead_tokens accounts for instructions + memory per batch."""
+    batches = []
+    current_batch = []
+    current_tokens = overhead_tokens
+
+    for msg in messages:
+        content = msg.get("content") or ""
+        att = msg.get("attachment_text") or ""
+        # Actual token estimate from the formatted line
+        msg_tokens = estimate_tokens(f"[xxxx-xx-xxTxx:xx] (user {msg['author_id']}): {content}\n{att}".strip())
+        if current_batch and current_tokens + msg_tokens > max_tokens:
+            batches.append(current_batch)
+            current_batch = []
+            current_tokens = overhead_tokens
+        current_batch.append(msg)
+        current_tokens += msg_tokens
+
+    if current_batch:
+        batches.append(current_batch)
+    return batches
+
+
 async def run_scan(guild_id: int, user_id: int, channel: discord.TextChannel,
-                   channel_id: int, instructions: str, model: str = "sonnet",
-                   batch_size: int = 100):
-    """Run the scan in background: iterate through messages, distill into memory."""
+                   channel_id: int, instructions: str, model: str = "sonnet"):
+    """Run the scan in background: large batches up to ~150k tokens each."""
     client = get_ai_client()
     if not client:
         await channel.send("Error: ANTHROPIC_API_KEY not set.")
         return
 
     model_id = MODEL_ALIASES.get(model, model)
-    total = await count_channel_messages(channel_id)
-    num_batches = math.ceil(total / batch_size)
 
-    if num_batches == 0:
+    # Fetch ALL messages from DB
+    all_msgs, total = await get_messages_page(channel_id, page=1, page_size=999999)
+    if not all_msgs:
         await channel.send("No messages to scan.")
         return
 
-    # Post progress message
+    batches = _build_scan_batches(all_msgs)
+    num_batches = len(batches)
+
     progress_msg = await channel.send(
         f"Scanning... {_make_progress_bar(0, num_batches)} 0/{num_batches} batches | starting..."
     )
@@ -489,25 +512,20 @@ async def run_scan(guild_id: int, user_id: int, channel: discord.TextChannel,
     start_time = time.monotonic()
     memory = await get_memory_notes(guild_id, user_id) or ""
 
-    for batch_num in range(1, num_batches + 1):
+    for batch_num, batch in enumerate(batches, 1):
         try:
-            messages, _ = await get_messages_page(channel_id, page=batch_num, page_size=batch_size)
-            if not messages:
-                break
-
-            batch_text = format_db_messages(messages)
+            batch_text = format_db_messages(batch)
 
             response = client.messages.create(
                 model=model_id,
-                max_tokens=2000,
+                max_tokens=8192,
                 system=instructions,
                 messages=[{
                     "role": "user",
-                    "content": f"Current memory notes:\n\n{memory}\n\n---\n\nMessages batch {batch_num}/{num_batches}:\n\n{batch_text}",
+                    "content": f"Current memory notes:\n\n{memory}\n\n---\n\nMessages batch {batch_num}/{num_batches} ({len(batch)} messages):\n\n{batch_text}",
                 }],
             )
 
-            # Extract updated memory from response
             text_blocks = [b.text for b in response.content if b.type == "text"]
             new_memory = "\n".join(text_blocks).strip()
             if new_memory:
@@ -519,7 +537,6 @@ async def run_scan(guild_id: int, user_id: int, channel: discord.TextChannel,
             await channel.send(f"Error on batch {batch_num}: {e}")
             break
 
-        # Update progress
         elapsed = time.monotonic() - start_time
         avg_per_batch = elapsed / batch_num
         remaining = avg_per_batch * (num_batches - batch_num)
@@ -535,7 +552,6 @@ async def run_scan(guild_id: int, user_id: int, channel: discord.TextChannel,
         except discord.HTTPException:
             pass
 
-    # Done
     total_time = time.monotonic() - start_time
     minutes = int(total_time // 60)
     seconds = int(total_time % 60)
@@ -547,7 +563,6 @@ async def run_scan(guild_id: int, user_id: int, channel: discord.TextChannel,
     except discord.HTTPException:
         pass
 
-    # Post summary
     summary = memory[:1500] + "..." if len(memory) > 1500 else memory
     await channel.send(f"**Scan finished.** Here's what I've captured in memory:\n\n{summary}")
 
@@ -754,37 +769,30 @@ async def _handle_tool_call(name: str, input_data: dict,
 
             if not confirmed:
                 # Preview mode: import if needed, then return stats
-                existing = await count_channel_messages(personal_channel_id)
-                if existing == 0:
-                    # Need to import from Discord first
-                    imported = await import_channel_messages(scan_channel)
-                    total = imported
-                else:
-                    # Check for new messages and import them
-                    imported = await import_channel_messages(scan_channel)
-                    total = await count_channel_messages(personal_channel_id)
+                imported = await import_channel_messages(scan_channel)
+                total = await count_channel_messages(personal_channel_id)
 
-                # Estimate total chars
-                all_msgs, _ = await get_messages_page(personal_channel_id, page=1, page_size=1)
-                # Sample-based estimate: get a few pages and extrapolate
-                sample_msgs, _ = await get_messages_page(personal_channel_id, page=1, page_size=100)
-                sample_chars = sum(len(m.get("content") or "") + len(m.get("attachment_text") or "") for m in sample_msgs)
-                if len(sample_msgs) > 0:
-                    avg_chars = sample_chars / len(sample_msgs)
-                else:
-                    avg_chars = 200
-                total_chars = int(avg_chars * total)
+                # Get ALL messages to compute actual text size and batches
+                all_msgs, _ = await get_messages_page(personal_channel_id, page=1, page_size=999999)
+                total_chars = sum(len(m.get("content") or "") + len(m.get("attachment_text") or "") for m in all_msgs)
+                total_tokens = estimate_tokens(
+                    "\n".join(
+                        f"[xxxx-xx-xxTxx:xx] (user {m['author_id']}): {(m.get('content') or '')} {(m.get('attachment_text') or '')}".strip()
+                        for m in all_msgs
+                    )
+                )
+                batches = _build_scan_batches(all_msgs)
+                num_batches = len(batches)
 
                 lines = [f"**Scan Preview**"]
                 lines.append(f"Messages stored: {total}" + (f" ({imported} newly imported)" if imported else ""))
-                lines.append(f"Estimated total text: ~{total_chars:,} chars (~{total_chars // 4:,} tokens)")
-                lines.append(f"Batches (100 msgs each): {math.ceil(total / 100)}")
+                lines.append(f"Total text: {total_chars:,} chars (~{total_tokens:,} tokens)")
+                lines.append(f"Batches (~150k tokens each): {num_batches}")
                 lines.append("")
                 lines.append("**Estimated cost per model:**")
-                for alias, model_id in MODEL_ALIASES.items():
-                    est = estimate_scan_cost(total_chars, alias, batch_size=100)
-                    est["num_batches"] = math.ceil(total / 100)
-                    lines.append(f"  {alias}: ~${est['total_cost']:.2f}")
+                for alias in MODEL_ALIASES:
+                    est = estimate_scan_cost(total_tokens, num_batches, alias)
+                    lines.append(f"  {alias}: ~${est['total_cost']:.3f}")
                 lines.append("")
                 lines.append("Draft your instructions for what to extract, show them to the user, "
                              "and call start_scan again with confirmed=true, instructions=..., and model=...")
@@ -800,7 +808,7 @@ async def _handle_tool_call(name: str, input_data: dict,
                 # Launch background task
                 asyncio.create_task(
                     run_scan(guild.id, user_id, channel, personal_channel_id,
-                             instructions, model, batch_size=100)
+                             instructions, model)
                 )
                 return "Scan started in background. Progress will be posted in the channel."
 
