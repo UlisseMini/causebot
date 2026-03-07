@@ -366,7 +366,15 @@ def build_wakeup_config_text(wakeups: list[dict]) -> str:
 
 
 def build_system_message(user_prompt: str, wakeup_config_text: str, memory_text: str) -> str:
+    now_utc = datetime.now(timezone.utc)
     return f"""{user_prompt}
+
+---
+CURRENT TIME: {now_utc.strftime('%Y-%m-%d %H:%M')} UTC ({now_utc.strftime('%A')})
+
+All timestamps in messages and schedules are UTC. When users mention times in other
+timezones (e.g. "11pm EST", "9am Pacific"), convert to UTC for storage/scheduling.
+Common offsets: EST=UTC-5, CST=UTC-6, MST=UTC-7, PST=UTC-8, EDT=UTC-4, CDT=UTC-5, MDT=UTC-6, PDT=UTC-7.
 
 ---
 MEMORY (persistent notes about this user):
@@ -564,8 +572,7 @@ async def run_scan(guild_id: int, user_id: int, channel: discord.TextChannel,
     except discord.HTTPException:
         pass
 
-    summary = memory[:1500] + "..." if len(memory) > 1500 else memory
-    await channel.send(f"**Scan finished.** Here's what I've captured in memory:\n\n{summary}")
+    await _send_long(channel, f"**Scan finished.** Here's what I've captured in memory:\n\n{memory}")
 
 
 # --- Main AI runner ---
@@ -649,8 +656,7 @@ RECENT CHANNEL MESSAGES:
                 text_blocks = [b.text for b in response.content if b.type == "text"]
                 final_text = "\n".join(text_blocks).strip()
                 if final_text:
-                    for chunk in _split_message(final_text):
-                        await channel.send(chunk)
+                    await _send_long(channel, final_text)
                 break
 
             messages.append({"role": "assistant", "content": response.content})
@@ -673,8 +679,7 @@ RECENT CHANNEL MESSAGES:
             text_blocks = [b.text for b in response.content if b.type == "text"]
             interim_text = "\n".join(text_blocks).strip()
             if interim_text:
-                for chunk in _split_message(interim_text):
-                    await channel.send(chunk)
+                await _send_long(channel, interim_text)
 
             if len(messages) > 16:
                 logging.warning(f"AI companion: too many tool rounds for user {user_id}")
@@ -835,6 +840,20 @@ def _split_message(text: str, limit: int = 2000) -> list[str]:
         chunks.append(text[:split_at])
         text = text[split_at:].lstrip("\n")
     return chunks
+
+
+async def _send_long(channel: discord.TextChannel, text: str, max_chunks: int = 3):
+    """Send text to Discord, uploading as a file if it would need too many messages."""
+    chunks = _split_message(text)
+    if len(chunks) <= max_chunks:
+        for chunk in chunks:
+            await channel.send(chunk)
+    else:
+        # Too long for Discord messages — upload as file
+        import io
+        file = discord.File(io.BytesIO(text.encode("utf-8")), filename="response.txt")
+        preview = text[:500] + "...\n\n*(full response attached as file)*"
+        await channel.send(preview, file=file)
 
 
 # --- The Cog ---
