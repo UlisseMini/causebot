@@ -102,6 +102,7 @@ user_ai_config = Table(
     Column("guild_id", BigInteger, primary_key=True),
     Column("user_id", BigInteger, primary_key=True),
     Column("system_prompt", String, nullable=True),
+    Column("memory_notes", String, nullable=True),
     Column("enabled", Integer, server_default="1"),
 )
 
@@ -116,4 +117,17 @@ user_ai_wakeups = Table(
     Column("message", String, nullable=True),
     Column("next_run_at", String, nullable=True),
     Column("enabled", Integer, server_default="1"),
+)
+
+channel_messages = Table(
+    "channel_messages",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("guild_id", BigInteger, nullable=False),
+    Column("channel_id", BigInteger, nullable=False),
+    Column("author_id", BigInteger, nullable=False),
+    Column("content", String, nullable=True),
+    Column("attachment_text", String, nullable=True),
+    Column("discord_message_id", BigInteger, nullable=False, unique=True),
+    Column("created_at", String, nullable=False),
 )

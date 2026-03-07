@@ -2,9 +2,10 @@ import discord
 from discord.ext import commands, tasks
 import os
 import json
-import re
 import logging
-import aiohttp
+import asyncio
+import time
+import math
 from datetime import datetime, timedelta, timezone
 from anthropic import Anthropic
 
@@ -17,6 +18,14 @@ from db.actions import (
     get_due_wakeups,
     update_wakeup_next_run,
     get_user_channel,
+    store_message,
+    get_messages_page,
+    search_messages_db,
+    count_channel_messages,
+    get_latest_stored_message_id,
+    get_recent_messages_db,
+    get_memory_notes,
+    set_memory_notes,
 )
 
 
@@ -32,14 +41,7 @@ def parse_time(time_str: str) -> tuple[int, int]:
 
 
 def compute_next_run(schedule: str, after: datetime | None = None) -> datetime:
-    """Compute the next run time for a schedule string.
-
-    Formats:
-        daily@HH:MM
-        weekly@DAY@HH:MM  (DAY = mon,tue,wed,thu,fri,sat,sun)
-        every_Nd@HH:MM
-        monthly@D@HH:MM   (D = day of month 1-28)
-    """
+    """Compute the next run time for a schedule string."""
     if after is None:
         after = datetime.now(timezone.utc)
 
@@ -70,7 +72,6 @@ def compute_next_run(schedule: str, after: datetime | None = None) -> datetime:
         candidate = after.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if candidate <= after:
             candidate += timedelta(days=1)
-        # Round up to next multiple of n days from epoch-ish anchor
         return candidate
 
     elif kind == "monthly":
@@ -78,7 +79,6 @@ def compute_next_run(schedule: str, after: datetime | None = None) -> datetime:
         hour, minute = parse_time(parts[2])
         candidate = after.replace(day=day_of_month, hour=hour, minute=minute, second=0, microsecond=0)
         if candidate <= after:
-            # Next month
             if after.month == 12:
                 candidate = candidate.replace(year=after.year + 1, month=1)
             else:
@@ -90,7 +90,6 @@ def compute_next_run(schedule: str, after: datetime | None = None) -> datetime:
 
 
 def schedule_to_human(schedule: str) -> str:
-    """Convert a schedule string to human-readable text."""
     parts = schedule.lower().split("@")
     kind = parts[0]
     if kind == "daily":
@@ -106,7 +105,6 @@ def schedule_to_human(schedule: str) -> str:
 
 
 def interval_to_timedelta(schedule: str) -> timedelta:
-    """Estimate the interval of a schedule as a timedelta (for context window sizing)."""
     parts = schedule.lower().split("@")
     kind = parts[0]
     if kind == "daily":
@@ -121,38 +119,89 @@ def interval_to_timedelta(schedule: str) -> timedelta:
     return timedelta(days=1)
 
 
-# --- Tool definitions for Claude API ---
+# --- Text attachment reading (for Discord import) ---
+
+TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", ".yml", ".yaml", ".toml", ".cfg", ".ini", ".sh", ".html", ".css", ".xml", ".rs", ".go", ".java", ".c", ".cpp", ".h", ".rb", ".pl"}
+MAX_ATTACHMENT_SIZE = 50_000
+
+
+async def read_text_attachment(attachment: discord.Attachment) -> str | None:
+    ext = os.path.splitext(attachment.filename)[1].lower()
+    if ext not in TEXT_EXTENSIONS:
+        return None
+    if attachment.size > MAX_ATTACHMENT_SIZE:
+        return f"[file too large: {attachment.filename} ({attachment.size} bytes)]"
+    try:
+        content_bytes = await attachment.read()
+        return content_bytes.decode("utf-8", errors="replace")
+    except Exception as e:
+        return f"[error reading {attachment.filename}: {e}]"
+
+
+# --- Cost estimation ---
+
+MODEL_PRICING = {
+    "claude-opus-4-6": {"input": 15.0, "output": 75.0},
+    "claude-sonnet-4-5": {"input": 3.0, "output": 15.0},
+    "claude-haiku-4-5": {"input": 0.80, "output": 4.0},
+}
+
+MODEL_ALIASES = {
+    "opus": "claude-opus-4-6",
+    "sonnet": "claude-sonnet-4-5",
+    "haiku": "claude-haiku-4-5",
+}
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token."""
+    return len(text) // 4
+
+
+def estimate_scan_cost(total_chars: int, model: str, batch_size: int = 100) -> dict:
+    """Estimate cost for a full scan. Returns dict with details."""
+    model_id = MODEL_ALIASES.get(model, model)
+    pricing = MODEL_PRICING.get(model_id, MODEL_PRICING["claude-sonnet-4-5"])
+
+    total_tokens = total_chars // 4
+    # Each batch sends: instructions + memory (~2k tokens) + batch messages
+    # Rough: each token is processed once as input, output is ~500 tokens per batch
+    avg_batch_input = total_tokens // max(1, total_chars // (batch_size * 500)) + 2000
+    num_batches = max(1, total_tokens // (batch_size * 125))  # ~125 tokens per message avg
+    total_input = total_tokens + (num_batches * 2000)  # overhead per batch
+    total_output = num_batches * 500  # ~500 tokens output per batch
+
+    input_cost = (total_input / 1_000_000) * pricing["input"]
+    output_cost = (total_output / 1_000_000) * pricing["output"]
+
+    return {
+        "model": model_id,
+        "total_messages": 0,  # filled by caller
+        "total_chars": total_chars,
+        "estimated_tokens": total_tokens,
+        "num_batches": num_batches,
+        "input_cost": round(input_cost, 2),
+        "output_cost": round(output_cost, 2),
+        "total_cost": round(input_cost + output_cost, 2),
+    }
+
+
+# --- Tool definitions ---
 
 TOOLS = [
     {
         "name": "search_channel_history",
         "description": (
-            "Search through the user's full channel history for messages matching a text query. "
-            "Returns matching messages with surrounding context. Use this when you need to reference "
-            "something the user said that isn't in the recent messages provided to you."
+            "Search through the user's full channel message history (stored in database) for messages "
+            "matching a text query. Returns matching messages with surrounding context messages."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Text to search for in message content",
-                },
-                "before_context": {
-                    "type": "integer",
-                    "description": "Number of messages to include before each match (default 3)",
-                    "default": 3,
-                },
-                "after_context": {
-                    "type": "integer",
-                    "description": "Number of messages to include after each match (default 3)",
-                    "default": 3,
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Maximum number of matching messages to return (default 10)",
-                    "default": 10,
-                },
+                "query": {"type": "string", "description": "Text to search for"},
+                "before_context": {"type": "integer", "description": "Messages to include before each match (default 3)", "default": 3},
+                "after_context": {"type": "integer", "description": "Messages to include after each match (default 3)", "default": 3},
+                "max_results": {"type": "integer", "description": "Max matches to return (default 10)", "default": 10},
             },
             "required": ["query"],
         },
@@ -160,9 +209,8 @@ TOOLS = [
     {
         "name": "set_wakeups",
         "description": (
-            "Set ALL scheduled wakeups for this user. This REPLACES the entire wakeup configuration. "
-            "Each wakeup triggers you (the AI) at the scheduled time with the given message as context. "
-            "You will always see the current full wakeup config in your context, so review it before making changes. "
+            "Set ALL scheduled wakeups. REPLACES the entire config. "
+            "Include existing wakeups you want to keep. "
             "Schedule formats: 'daily@HH:MM', 'weekly@DAY@HH:MM' (mon-sun), 'every_Nd@HH:MM', 'monthly@D@HH:MM'."
         ),
         "input_schema": {
@@ -173,18 +221,9 @@ TOOLS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "label": {
-                                "type": "string",
-                                "description": "Short name for this wakeup (e.g. 'morning_checkin')",
-                            },
-                            "schedule": {
-                                "type": "string",
-                                "description": "When to trigger (e.g. 'daily@09:00', 'weekly@mon@18:00')",
-                            },
-                            "message": {
-                                "type": "string",
-                                "description": "Context message you'll receive when this wakeup fires",
-                            },
+                            "label": {"type": "string"},
+                            "schedule": {"type": "string"},
+                            "message": {"type": "string"},
                         },
                         "required": ["label", "schedule", "message"],
                     },
@@ -195,20 +234,70 @@ TOOLS = [
     },
     {
         "name": "update_system_prompt",
+        "description": "Update your own system prompt. Your current prompt is always shown in your context.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "new_prompt": {"type": "string", "description": "The new system prompt"},
+            },
+            "required": ["new_prompt"],
+        },
+    },
+    {
+        "name": "update_memory",
         "description": (
-            "Update your own system prompt. This changes how you behave in future interactions with this user. "
-            "Use this when the user asks you to change your personality, approach, or instructions. "
-            "Your current system prompt is always shown in your context."
+            "Update your persistent memory notes about this user. These notes survive across all conversations "
+            "and are always loaded into your context. Store distilled understanding — goals, patterns, "
+            "commitments, preferences, key context. NOT conversation transcripts. Keep concise."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "new_prompt": {
-                    "type": "string",
-                    "description": "The new system prompt to use for future interactions",
-                },
+                "memory": {"type": "string", "description": "The complete updated memory notes (replaces all existing notes)"},
             },
-            "required": ["new_prompt"],
+            "required": ["memory"],
+        },
+    },
+    {
+        "name": "read_messages",
+        "description": (
+            "Read stored messages from the user's channel in pages. "
+            "Returns messages + total count + estimated total tokens for the range. "
+            "Use for browsing history or quick lookups beyond what's in your recent context."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "page": {"type": "integer", "description": "Page number (default 1)", "default": 1},
+                "page_size": {"type": "integer", "description": "Messages per page (default 50, max 200)", "default": 50},
+                "after_date": {"type": "string", "description": "Only messages after this ISO date (optional)"},
+                "before_date": {"type": "string", "description": "Only messages before this ISO date (optional)"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "start_scan",
+        "description": (
+            "Scan the user's full message history and distill it into memory. "
+            "TWO MODES:\n"
+            "1. PREVIEW (confirmed=false): Imports messages from Discord if needed, returns message count "
+            "and cost estimates per model. Use this first to show the user what the scan will involve.\n"
+            "2. RUN (confirmed=true): Requires 'instructions' and 'model'. Runs the scan in the background. "
+            "The instructions are the COMPLETE prompt used for each batch — they define exactly what to "
+            "extract and how to update memory. Draft these carefully and show them to the user for approval "
+            "before running.\n\n"
+            "IMPORTANT: Always preview first, show the user the plan + cost + your drafted instructions, "
+            "and only run after they confirm."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "confirmed": {"type": "boolean", "description": "false=preview, true=run", "default": False},
+                "instructions": {"type": "string", "description": "Complete prompt for the distillation. Required when confirmed=true."},
+                "model": {"type": "string", "description": "Model to use: 'opus', 'sonnet', or 'haiku' (default 'sonnet')", "default": "sonnet"},
+            },
+            "required": [],
         },
     },
 ]
@@ -223,6 +312,11 @@ stay on track with their goals, reflect on their progress, and maintain good hab
 Be direct and genuine. Reference what they've actually said and done. \
 Push back thoughtfully when needed — don't just agree with everything. \
 If they set commitments, hold them to it while being understanding about genuine reassessment.
+
+You have persistent memory that survives across conversations. After interactions where \
+you learn something important about the user, update your memory. Store distilled understanding: \
+goals, patterns, commitments, concerns, preferences, key life context. \
+Don't store conversation transcripts — store what you *learned*.
 
 Keep your messages concise. This is Discord, not an essay."""
 
@@ -244,47 +338,21 @@ def get_ai_client() -> Anthropic | None:
 
 # --- Context assembly ---
 
-TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", ".yml", ".yaml", ".toml", ".cfg", ".ini", ".sh", ".html", ".css", ".xml", ".rs", ".go", ".java", ".c", ".cpp", ".h", ".rb", ".pl"}
-MAX_ATTACHMENT_SIZE = 50_000  # 50KB limit per file to avoid blowing up context
-
-
-async def read_text_attachment(attachment: discord.Attachment) -> str | None:
-    """Download and return text content from an attachment, or None if not a text file."""
-    ext = os.path.splitext(attachment.filename)[1].lower()
-    if ext not in TEXT_EXTENSIONS:
-        return None
-    if attachment.size > MAX_ATTACHMENT_SIZE:
-        return f"[file too large: {attachment.filename} ({attachment.size} bytes)]"
-    try:
-        content_bytes = await attachment.read()
-        return content_bytes.decode("utf-8", errors="replace")
-    except Exception as e:
-        return f"[error reading {attachment.filename}: {e}]"
-
-
-async def format_channel_messages(messages: list[discord.Message]) -> str:
-    """Format Discord messages into a text block for the AI, including text file contents."""
+def format_db_messages(messages: list[dict]) -> str:
+    """Format messages from DB into text for the AI."""
     lines = []
     for msg in messages:
-        ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
-        author = msg.author.display_name
-        content = msg.content or ""
-        if msg.attachments:
-            att_parts = []
-            for a in msg.attachments:
-                file_content = await read_text_attachment(a)
-                if file_content is not None:
-                    att_parts.append(f"[file: {a.filename}]\n{file_content}\n[/file: {a.filename}]")
-                else:
-                    att_parts.append(f"[attachment: {a.filename}]")
-            content = f"{content}\n{''.join(att_parts)}".strip() if att_parts else content
+        ts = msg["created_at"][:16]  # trim to YYYY-MM-DDTHH:MM
+        content = msg.get("content") or ""
+        att = msg.get("attachment_text")
+        if att:
+            content = f"{content}\n{att}".strip()
         if content:
-            lines.append(f"[{ts}] {author}: {content}")
-    return "\n".join(lines)
+            lines.append(f"[{ts}] (user {msg['author_id']}): {content}")
+    return "\n".join(lines) if lines else "(No messages)"
 
 
 def build_wakeup_config_text(wakeups: list[dict]) -> str:
-    """Format the full wakeup config for inclusion in context."""
     if not wakeups:
         return "No scheduled wakeups configured."
     lines = ["Current scheduled wakeups:"]
@@ -297,116 +365,180 @@ def build_wakeup_config_text(wakeups: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_system_message(user_prompt: str, wakeup_config_text: str) -> str:
-    """Build the full system message for the AI."""
+def build_system_message(user_prompt: str, wakeup_config_text: str, memory_text: str) -> str:
     return f"""{user_prompt}
 
 ---
-CONFIGURATION (always visible to you):
+MEMORY (persistent notes about this user):
+
+{memory_text}
+
+---
+CONFIGURATION:
 
 {wakeup_config_text}
 
 ---
 TOOLS:
-You have tools to search the user's channel history for older messages, update your scheduled wakeups, \
-and update your own system prompt. Use them when appropriate. When the user asks you to set up \
-reminders or check-ins, use set_wakeups. When they ask you to change how you behave, use update_system_prompt.
-
-When using set_wakeups, you REPLACE all wakeups. So always include existing wakeups you want to keep \
-alongside any new ones you're adding. Review the current config above before making changes."""
-
-
-# --- Tool execution ---
-
-async def _message_full_text(msg: discord.Message) -> str:
-    """Get full searchable text for a message, including text file attachments."""
-    parts = []
-    if msg.content:
-        parts.append(msg.content)
-    for a in msg.attachments:
-        file_content = await read_text_attachment(a)
-        if file_content is not None:
-            parts.append(file_content)
-    return "\n".join(parts)
+- search_channel_history: Search stored messages by text
+- set_wakeups: Manage scheduled check-ins (REPLACES all — include ones to keep)
+- update_system_prompt: Edit your own system prompt
+- update_memory: Update your persistent memory notes about this user
+- read_messages: Browse stored message history in pages
+- start_scan: Bulk scan + distill message history into memory (preview first, then confirm)"""
 
 
-async def _format_search_message(msg: discord.Message, marker: str = "") -> str:
-    """Format a single message for search results, including file contents."""
-    ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
-    content = msg.content or "[no text]"
-    att_parts = []
-    for a in msg.attachments:
-        file_content = await read_text_attachment(a)
-        if file_content is not None:
-            att_parts.append(f"[file: {a.filename}]\n{file_content}\n[/file: {a.filename}]")
-        else:
-            att_parts.append(f"[attachment: {a.filename}]")
-    if att_parts:
-        content = f"{content}\n{''.join(att_parts)}"
-    return f"[{ts}] {msg.author.display_name}: {content}{marker}"
+# --- Discord import ---
+
+async def import_channel_messages(channel: discord.TextChannel, progress_callback=None) -> int:
+    """Import messages from Discord into the DB. Incremental — skips already-stored messages."""
+    last_id = await get_latest_stored_message_id(channel.id)
+
+    # If we have a last_id, fetch the message to get its timestamp for after=
+    after_msg = None
+    if last_id:
+        try:
+            after_msg = await channel.fetch_message(last_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            after_msg = None
+
+    count = 0
+    async for msg in channel.history(limit=None, oldest_first=True, after=after_msg):
+        if msg.author.bot:
+            continue
+
+        # Read text attachments
+        att_parts = []
+        for a in msg.attachments:
+            ext = os.path.splitext(a.filename)[1].lower()
+            if ext in TEXT_EXTENSIONS and a.size <= MAX_ATTACHMENT_SIZE:
+                try:
+                    content_bytes = await a.read()
+                    att_parts.append(f"[file: {a.filename}]\n{content_bytes.decode('utf-8', errors='replace')}\n[/file: {a.filename}]")
+                except Exception:
+                    att_parts.append(f"[attachment: {a.filename}]")
+            elif a.filename:
+                att_parts.append(f"[attachment: {a.filename}]")
+
+        attachment_text = "\n".join(att_parts) if att_parts else None
+
+        await store_message(
+            guild_id=msg.guild.id if msg.guild else 0,
+            channel_id=channel.id,
+            author_id=msg.author.id,
+            content=msg.content,
+            attachment_text=attachment_text,
+            discord_message_id=msg.id,
+            created_at=msg.created_at.isoformat(),
+        )
+        count += 1
+
+        if progress_callback and count % 500 == 0:
+            await progress_callback(count)
+
+    return count
 
 
-async def execute_search(channel: discord.TextChannel, query: str,
-                         before_context: int = 3, after_context: int = 3,
-                         max_results: int = 10) -> str:
-    """Search channel history for messages matching query, with surrounding context."""
-    query_lower = query.lower()
-    all_messages = []
-    try:
-        async for msg in channel.history(limit=2000):
-            all_messages.append(msg)
-    except discord.Forbidden:
-        return "Error: no permission to read channel history."
-    except discord.HTTPException as e:
-        return f"Error reading channel history: {e}"
+# --- Scan execution ---
 
-    # Reverse to chronological order
-    all_messages.reverse()
+def _make_progress_bar(current: int, total: int, width: int = 16) -> str:
+    filled = int(width * current / max(total, 1))
+    bar = "\u2588" * filled + "\u2591" * (width - filled)
+    return f"[{bar}]"
 
-    # Find matching indices — search message text AND file contents
-    match_indices = []
-    for i, msg in enumerate(all_messages):
-        full_text = await _message_full_text(msg)
-        if query_lower in full_text.lower():
-            match_indices.append(i)
-            if len(match_indices) >= max_results:
+
+async def run_scan(guild_id: int, user_id: int, channel: discord.TextChannel,
+                   channel_id: int, instructions: str, model: str = "sonnet",
+                   batch_size: int = 100):
+    """Run the scan in background: iterate through messages, distill into memory."""
+    client = get_ai_client()
+    if not client:
+        await channel.send("Error: ANTHROPIC_API_KEY not set.")
+        return
+
+    model_id = MODEL_ALIASES.get(model, model)
+    total = await count_channel_messages(channel_id)
+    num_batches = math.ceil(total / batch_size)
+
+    if num_batches == 0:
+        await channel.send("No messages to scan.")
+        return
+
+    # Post progress message
+    progress_msg = await channel.send(
+        f"Scanning... {_make_progress_bar(0, num_batches)} 0/{num_batches} batches | starting..."
+    )
+
+    start_time = time.monotonic()
+    memory = await get_memory_notes(guild_id, user_id) or ""
+
+    for batch_num in range(1, num_batches + 1):
+        try:
+            messages, _ = await get_messages_page(channel_id, page=batch_num, page_size=batch_size)
+            if not messages:
                 break
 
-    if not match_indices:
-        return f"No messages found matching '{query}'."
+            batch_text = format_db_messages(messages)
 
-    # Build results with context
-    results = []
-    seen = set()
-    for idx in match_indices:
-        start = max(0, idx - before_context)
-        end = min(len(all_messages), idx + after_context + 1)
-        group = []
-        for i in range(start, end):
-            if i not in seen:
-                seen.add(i)
-                marker = " <<< MATCH" if i == idx else ""
-                line = await _format_search_message(all_messages[i], marker)
-                group.append(line)
-        if group:
-            results.append("\n".join(group))
+            response = client.messages.create(
+                model=model_id,
+                max_tokens=2000,
+                system=instructions,
+                messages=[{
+                    "role": "user",
+                    "content": f"Current memory notes:\n\n{memory}\n\n---\n\nMessages batch {batch_num}/{num_batches}:\n\n{batch_text}",
+                }],
+            )
 
-    return f"Found {len(match_indices)} match(es) for '{query}':\n\n" + "\n---\n".join(results)
+            # Extract updated memory from response
+            text_blocks = [b.text for b in response.content if b.type == "text"]
+            new_memory = "\n".join(text_blocks).strip()
+            if new_memory:
+                memory = new_memory
+                await set_memory_notes(guild_id, user_id, memory)
+
+        except Exception as e:
+            logging.error(f"Scan batch {batch_num} error: {e}")
+            await channel.send(f"Error on batch {batch_num}: {e}")
+            break
+
+        # Update progress
+        elapsed = time.monotonic() - start_time
+        avg_per_batch = elapsed / batch_num
+        remaining = avg_per_batch * (num_batches - batch_num)
+        eta_min = int(remaining // 60)
+        eta_sec = int(remaining % 60)
+
+        try:
+            await progress_msg.edit(
+                content=f"Scanning... {_make_progress_bar(batch_num, num_batches)} "
+                        f"{batch_num}/{num_batches} batches | "
+                        f"~{eta_min}m{eta_sec:02d}s remaining"
+            )
+        except discord.HTTPException:
+            pass
+
+    # Done
+    total_time = time.monotonic() - start_time
+    minutes = int(total_time // 60)
+    seconds = int(total_time % 60)
+    try:
+        await progress_msg.edit(
+            content=f"Scan complete! {_make_progress_bar(num_batches, num_batches)} "
+                    f"{num_batches}/{num_batches} batches | {minutes}m{seconds:02d}s"
+        )
+    except discord.HTTPException:
+        pass
+
+    # Post summary
+    summary = memory[:1500] + "..." if len(memory) > 1500 else memory
+    await channel.send(f"**Scan finished.** Here's what I've captured in memory:\n\n{summary}")
 
 
 # --- Main AI runner ---
 
 async def run_ai(guild: discord.Guild, user_id: int, channel: discord.TextChannel,
                  trigger_info: str, context_window: timedelta | None = None):
-    """Run the AI companion for a user.
-
-    Args:
-        guild: The Discord guild
-        user_id: The user's ID
-        channel: The channel to read from and post to
-        trigger_info: Description of why the AI is running (shown in context)
-        context_window: How far back to fetch messages (default: 2 days)
-    """
     client = get_ai_client()
     if not client:
         logging.error("AI companion: ANTHROPIC_API_KEY not set")
@@ -423,22 +555,42 @@ async def run_ai(guild: discord.Guild, user_id: int, channel: discord.TextChanne
     system_prompt = config["system_prompt"] or DEFAULT_SYSTEM_PROMPT
     wakeups = await get_ai_wakeups(guild.id, user_id)
     wakeup_config_text = build_wakeup_config_text(wakeups)
+    memory = config.get("memory_notes") or "(No memory notes yet. Use update_memory to start building knowledge about this user.)"
 
-    # Fetch channel history
+    # Fetch recent context from DB, fall back to Discord
     if context_window is None:
         context_window = timedelta(days=2)
-    after_time = datetime.now(timezone.utc) - context_window
+    after_date = (datetime.now(timezone.utc) - context_window).isoformat()
 
-    history_messages = []
-    try:
-        async for msg in channel.history(after=after_time, oldest_first=True, limit=200):
-            history_messages.append(msg)
-    except (discord.Forbidden, discord.HTTPException) as e:
-        logging.error(f"AI companion: failed to fetch history for channel {channel.id}: {e}")
+    # Try DB first
+    personal_channel_id = await get_user_channel(guild.id, user_id)
+    ctx_channel_id = personal_channel_id or channel.id
+    db_messages = await get_recent_messages_db(ctx_channel_id, limit=200, after_date=after_date)
 
-    history_text = (await format_channel_messages(history_messages)) if history_messages else "(No recent messages)"
+    if db_messages:
+        history_text = format_db_messages(db_messages)
+    else:
+        # Fall back to Discord API
+        history_messages = []
+        after_time = datetime.now(timezone.utc) - context_window
+        try:
+            async for msg in channel.history(after=after_time, oldest_first=True, limit=200):
+                history_messages.append(msg)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            logging.error(f"AI companion: failed to fetch history: {e}")
 
-    system = build_system_message(system_prompt, wakeup_config_text)
+        if history_messages:
+            lines = []
+            for msg in history_messages:
+                ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
+                content = msg.content or ""
+                if content:
+                    lines.append(f"[{ts}] {msg.author.display_name}: {content}")
+            history_text = "\n".join(lines)
+        else:
+            history_text = "(No recent messages)"
+
+    system = build_system_message(system_prompt, wakeup_config_text, memory)
 
     user_message = f"""TRIGGER: {trigger_info}
 
@@ -458,27 +610,23 @@ RECENT CHANNEL MESSAGES:
                 tools=TOOLS,
             )
 
-            # Check for tool use
             tool_uses = [b for b in response.content if b.type == "tool_use"]
 
             if not tool_uses:
-                # No tool calls — extract text and send
                 text_blocks = [b.text for b in response.content if b.type == "text"]
                 final_text = "\n".join(text_blocks).strip()
                 if final_text:
-                    # Split if over Discord limit
                     for chunk in _split_message(final_text):
                         await channel.send(chunk)
                 break
 
-            # Process tool calls
             messages.append({"role": "assistant", "content": response.content})
 
             tool_results = []
             for tool_use in tool_uses:
                 result = await _handle_tool_call(
                     tool_use.name, tool_use.input,
-                    guild, user_id, channel, wakeups
+                    guild, user_id, channel
                 )
                 tool_results.append({
                     "type": "tool_result",
@@ -488,15 +636,14 @@ RECENT CHANNEL MESSAGES:
 
             messages.append({"role": "user", "content": tool_results})
 
-            # Also send any text that came with the tool calls
+            # Send interim text
             text_blocks = [b.text for b in response.content if b.type == "text"]
             interim_text = "\n".join(text_blocks).strip()
             if interim_text:
                 for chunk in _split_message(interim_text):
                     await channel.send(chunk)
 
-            # Safety: limit tool call rounds
-            if len(messages) > 12:
+            if len(messages) > 16:
                 logging.warning(f"AI companion: too many tool rounds for user {user_id}")
                 break
 
@@ -506,25 +653,38 @@ RECENT CHANNEL MESSAGES:
 
 async def _handle_tool_call(name: str, input_data: dict,
                             guild: discord.Guild, user_id: int,
-                            channel: discord.TextChannel,
-                            current_wakeups: list[dict]) -> str:
-    """Execute a tool call and return the result string."""
+                            channel: discord.TextChannel) -> str:
     try:
         if name == "search_channel_history":
-            return await execute_search(
-                channel,
+            personal_channel_id = await get_user_channel(guild.id, user_id)
+            search_channel_id = personal_channel_id or channel.id
+            results = await search_messages_db(
+                search_channel_id,
                 input_data["query"],
                 before_context=input_data.get("before_context", 3),
                 after_context=input_data.get("after_context", 3),
                 max_results=input_data.get("max_results", 10),
             )
+            if not results:
+                return f"No messages found matching '{input_data['query']}'."
+
+            output_parts = [f"Found {len(results)} match(es) for '{input_data['query']}':"]
+            for r in results:
+                group_lines = []
+                for msg in r["context"]:
+                    ts = msg["created_at"][:16]
+                    content = msg.get("content") or ""
+                    att = msg.get("attachment_text") or ""
+                    text = f"{content}\n{att}".strip() if att else content
+                    marker = " <<< MATCH" if msg["id"] == r["match"]["id"] else ""
+                    group_lines.append(f"[{ts}] (user {msg['author_id']}): {text}{marker}")
+                output_parts.append("\n".join(group_lines))
+            return "\n---\n".join(output_parts)
 
         elif name == "set_wakeups":
-            wakeups_data = input_data["wakeups"]
-            # Compute next_run_at for each
             now = datetime.now(timezone.utc)
             wakeups_to_store = []
-            for w in wakeups_data:
+            for w in input_data["wakeups"]:
                 try:
                     next_run = compute_next_run(w["schedule"], after=now)
                     wakeups_to_store.append({
@@ -535,19 +695,97 @@ async def _handle_tool_call(name: str, input_data: dict,
                     })
                 except ValueError as e:
                     return f"Error with schedule '{w['schedule']}': {e}"
-
             await set_ai_wakeups(guild.id, user_id, wakeups_to_store)
-
-            # Format confirmation
             lines = ["Wakeups updated:"]
             for w in wakeups_to_store:
                 lines.append(f"  - {w['label']}: {schedule_to_human(w['schedule'])} (next: {w['next_run_at'][:16]})")
             return "\n".join(lines)
 
         elif name == "update_system_prompt":
-            new_prompt = input_data["new_prompt"]
-            await update_ai_system_prompt(guild.id, user_id, new_prompt)
+            await update_ai_system_prompt(guild.id, user_id, input_data["new_prompt"])
             return "System prompt updated successfully."
+
+        elif name == "update_memory":
+            await set_memory_notes(guild.id, user_id, input_data["memory"])
+            return "Memory updated successfully."
+
+        elif name == "read_messages":
+            personal_channel_id = await get_user_channel(guild.id, user_id)
+            read_channel_id = personal_channel_id or channel.id
+            page = input_data.get("page", 1)
+            page_size = min(input_data.get("page_size", 50), 200)
+            messages, total = await get_messages_page(
+                read_channel_id, page=page, page_size=page_size,
+                after_date=input_data.get("after_date"),
+                before_date=input_data.get("before_date"),
+            )
+            total_chars = sum(len(m.get("content") or "") + len(m.get("attachment_text") or "") for m in messages)
+            text = format_db_messages(messages)
+            return (
+                f"Page {page} ({len(messages)} messages, {total} total in range, "
+                f"~{estimate_tokens(text)} tokens this page):\n\n{text}"
+            )
+
+        elif name == "start_scan":
+            confirmed = input_data.get("confirmed", False)
+            personal_channel_id = await get_user_channel(guild.id, user_id)
+            if not personal_channel_id:
+                return "Error: user has no personal channel."
+            scan_channel = guild.get_channel(personal_channel_id)
+            if not scan_channel:
+                return "Error: personal channel not found."
+
+            if not confirmed:
+                # Preview mode: import if needed, then return stats
+                existing = await count_channel_messages(personal_channel_id)
+                if existing == 0:
+                    # Need to import from Discord first
+                    imported = await import_channel_messages(scan_channel)
+                    total = imported
+                else:
+                    # Check for new messages and import them
+                    imported = await import_channel_messages(scan_channel)
+                    total = await count_channel_messages(personal_channel_id)
+
+                # Estimate total chars
+                all_msgs, _ = await get_messages_page(personal_channel_id, page=1, page_size=1)
+                # Sample-based estimate: get a few pages and extrapolate
+                sample_msgs, _ = await get_messages_page(personal_channel_id, page=1, page_size=100)
+                sample_chars = sum(len(m.get("content") or "") + len(m.get("attachment_text") or "") for m in sample_msgs)
+                if len(sample_msgs) > 0:
+                    avg_chars = sample_chars / len(sample_msgs)
+                else:
+                    avg_chars = 200
+                total_chars = int(avg_chars * total)
+
+                lines = [f"**Scan Preview**"]
+                lines.append(f"Messages stored: {total}" + (f" ({imported} newly imported)" if imported else ""))
+                lines.append(f"Estimated total text: ~{total_chars:,} chars (~{total_chars // 4:,} tokens)")
+                lines.append(f"Batches (100 msgs each): {math.ceil(total / 100)}")
+                lines.append("")
+                lines.append("**Estimated cost per model:**")
+                for alias, model_id in MODEL_ALIASES.items():
+                    est = estimate_scan_cost(total_chars, alias, batch_size=100)
+                    est["num_batches"] = math.ceil(total / 100)
+                    lines.append(f"  {alias}: ~${est['total_cost']:.2f}")
+                lines.append("")
+                lines.append("Draft your instructions for what to extract, show them to the user, "
+                             "and call start_scan again with confirmed=true, instructions=..., and model=...")
+                return "\n".join(lines)
+
+            else:
+                # Run mode
+                instructions = input_data.get("instructions")
+                if not instructions:
+                    return "Error: 'instructions' required when confirmed=true."
+                model = input_data.get("model", "sonnet")
+
+                # Launch background task
+                asyncio.create_task(
+                    run_scan(guild.id, user_id, channel, personal_channel_id,
+                             instructions, model, batch_size=100)
+                )
+                return "Scan started in background. Progress will be posted in the channel."
 
         else:
             return f"Unknown tool: {name}"
@@ -558,7 +796,6 @@ async def _handle_tool_call(name: str, input_data: dict,
 
 
 def _split_message(text: str, limit: int = 2000) -> list[str]:
-    """Split text into chunks that fit Discord's message limit."""
     if len(text) <= limit:
         return [text]
     chunks = []
@@ -566,7 +803,6 @@ def _split_message(text: str, limit: int = 2000) -> list[str]:
         if len(text) <= limit:
             chunks.append(text)
             break
-        # Try to split at a newline
         split_at = text.rfind("\n", 0, limit)
         if split_at == -1:
             split_at = limit
@@ -581,15 +817,12 @@ class AICompanion(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.check_wakeups.start()
-        # Track bot message IDs so we know when users reply to us
-        self._bot_message_ids: set[int] = set()
 
     def cog_unload(self):
         self.check_wakeups.cancel()
 
     @tasks.loop(seconds=60)
     async def check_wakeups(self):
-        """Check for due wakeups and fire them."""
         try:
             due = await get_due_wakeups()
             for wakeup in due:
@@ -602,7 +835,6 @@ class AICompanion(commands.Cog):
         await self.bot.wait_until_ready()
 
     async def _fire_wakeup(self, wakeup: dict):
-        """Fire a single wakeup: run the AI and reschedule."""
         guild_id = wakeup["guild_id"]
         user_id = wakeup["user_id"]
 
@@ -610,7 +842,6 @@ class AICompanion(commands.Cog):
         if not guild:
             return
 
-        # Find user's personal channel
         channel_id = await get_user_channel(guild_id, user_id)
         if not channel_id:
             return
@@ -618,11 +849,8 @@ class AICompanion(commands.Cog):
         if not channel:
             return
 
-        # Context window = 2x the wakeup interval
         interval = interval_to_timedelta(wakeup["schedule"])
-        context_window = interval * 2
-        # Clamp to reasonable range
-        context_window = max(context_window, timedelta(days=1))
+        context_window = max(interval * 2, timedelta(days=1))
         context_window = min(context_window, timedelta(days=60))
 
         trigger_info = f"Scheduled wakeup: {wakeup['label']}"
@@ -634,7 +862,6 @@ class AICompanion(commands.Cog):
         except Exception as e:
             logging.error(f"AI companion: error firing wakeup {wakeup['id']}: {e}")
 
-        # Reschedule
         try:
             now = datetime.now(timezone.utc)
             next_run = compute_next_run(wakeup["schedule"], after=now)
@@ -644,10 +871,35 @@ class AICompanion(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """Respond when a user @mentions the bot or replies to its messages."""
-        if message.author.bot:
-            return
+        """Store messages + respond to @mentions and replies."""
         if not message.guild:
+            return
+
+        # Store every non-bot message in DB
+        if not message.author.bot:
+            att_parts = []
+            for a in message.attachments:
+                ext = os.path.splitext(a.filename)[1].lower()
+                if ext in TEXT_EXTENSIONS and a.size <= MAX_ATTACHMENT_SIZE:
+                    try:
+                        content_bytes = await a.read()
+                        att_parts.append(f"[file: {a.filename}]\n{content_bytes.decode('utf-8', errors='replace')}\n[/file: {a.filename}]")
+                    except Exception:
+                        att_parts.append(f"[attachment: {a.filename}]")
+                elif a.filename:
+                    att_parts.append(f"[attachment: {a.filename}]")
+
+            await store_message(
+                guild_id=message.guild.id,
+                channel_id=message.channel.id,
+                author_id=message.author.id,
+                content=message.content,
+                attachment_text="\n".join(att_parts) if att_parts else None,
+                discord_message_id=message.id,
+                created_at=message.created_at.isoformat(),
+            )
+
+        if message.author.bot:
             return
 
         triggered = False
@@ -656,11 +908,10 @@ class AICompanion(commands.Cog):
         # Check for @mention
         if self.bot.user in message.mentions:
             triggered = True
-            # Strip the mention from the message for cleaner context
             clean_content = message.content.replace(f"<@{self.bot.user.id}>", "").replace(f"<@!{self.bot.user.id}>", "").strip()
             trigger_info = f"User @mentioned you in #{message.channel.name}: \"{clean_content}\""
 
-        # Check if this is a reply to one of our messages
+        # Check if reply to bot
         if not triggered and message.reference and message.reference.message_id:
             try:
                 replied_to = await message.channel.fetch_message(message.reference.message_id)
@@ -673,12 +924,10 @@ class AICompanion(commands.Cog):
         if not triggered:
             return
 
-        # Check if user has AI config
         config = await get_ai_config(message.guild.id, message.author.id)
         if not config or not config["enabled"]:
             return
 
-        # Respond in whatever channel the interaction happened
         await run_ai(
             message.guild, message.author.id, message.channel,
             trigger_info, timedelta(days=2)
@@ -695,13 +944,9 @@ class AICompanion(commands.Cog):
             await ctx.respond("AI companion not configured (ANTHROPIC_API_KEY not set).", ephemeral=True)
             return
 
-        # Find user's personal channel
         channel_id = await get_user_channel(guild.id, ctx.author.id)
         if not channel_id:
-            await ctx.respond(
-                "You need a personal channel first. Use `/channel add` to create one.",
-                ephemeral=True,
-            )
+            await ctx.respond("You need a personal channel first. Use `/channel add` to create one.", ephemeral=True)
             return
         channel = guild.get_channel(channel_id)
         if not channel:
@@ -712,13 +957,13 @@ class AICompanion(commands.Cog):
 
         config = await get_ai_config(guild.id, ctx.author.id)
         if not config:
-            # First time setup
             await upsert_ai_config(guild.id, ctx.author.id, DEFAULT_SYSTEM_PROMPT)
             trigger = (
                 "User is setting up their AI companion for the first time. "
                 "Introduce yourself briefly. Ask what they'd like help with — "
                 "goals, habits, accountability, reflections, etc. "
-                "Let them know they can ask you to set up scheduled check-ins."
+                "Let them know they can ask you to set up scheduled check-ins "
+                "and that you can scan their message history to learn about them."
             )
         else:
             trigger = "User initiated conversation with /ai"

@@ -118,6 +118,36 @@ def migration_009_create_user_ai_wakeups(conn):
     """))
 
 
+def migration_010_create_channel_messages(conn):
+    """Create channel_messages table for full-text message storage."""
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS channel_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id BIGINT NOT NULL,
+            channel_id BIGINT NOT NULL,
+            author_id BIGINT NOT NULL,
+            content TEXT,
+            attachment_text TEXT,
+            discord_message_id BIGINT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
+        )
+    """))
+    conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS idx_channel_messages_channel_time
+        ON channel_messages (channel_id, created_at)
+    """))
+    conn.execute(text("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_messages_discord_id
+        ON channel_messages (discord_message_id)
+    """))
+
+
+def migration_011_add_memory_notes(conn):
+    """Add memory_notes column to user_ai_config."""
+    if not _column_exists(conn, "user_ai_config", "memory_notes"):
+        conn.execute(text("ALTER TABLE user_ai_config ADD COLUMN memory_notes TEXT"))
+
+
 MIGRATIONS = [
     ("001_create_guild_settings", migration_001_create_guild_settings),
     ("002_add_last_journal_message", migration_002_add_last_journal_message),
@@ -128,6 +158,8 @@ MIGRATIONS = [
     ("007_add_active_days", migration_007_add_active_days),
     ("008_create_user_ai_config", migration_008_create_user_ai_config),
     ("009_create_user_ai_wakeups", migration_009_create_user_ai_wakeups),
+    ("010_create_channel_messages", migration_010_create_channel_messages),
+    ("011_add_memory_notes", migration_011_add_memory_notes),
 ]
 
 

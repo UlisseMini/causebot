@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine
 from datetime import datetime, timedelta
 from db.connection import database, DATABASE_URL
-from db.schema import users, guilds, user_private_channels, user_xp, message_logs, guild_settings, reminders, one_on_one_pool, one_on_one_matches, user_ai_config, user_ai_wakeups, metadata
+from db.schema import users, guilds, user_private_channels, user_xp, message_logs, guild_settings, reminders, one_on_one_pool, one_on_one_matches, user_ai_config, user_ai_wakeups, channel_messages, metadata
 
 
 async def get_user_channel(guild_id: int, user_id: int):
@@ -693,5 +693,161 @@ async def update_wakeup_next_run(wakeup_id: int, next_run_at: str):
         user_ai_wakeups.update().where(
             user_ai_wakeups.c.id == wakeup_id
         ).values(next_run_at=next_run_at)
+    )
+
+
+# --- Channel Messages ---
+
+async def store_message(guild_id: int, channel_id: int, author_id: int,
+                        content: str | None, attachment_text: str | None,
+                        discord_message_id: int, created_at: str):
+    """Store a message. Silently skips if discord_message_id already exists."""
+    try:
+        await database.execute(
+            channel_messages.insert().values(
+                guild_id=guild_id,
+                channel_id=channel_id,
+                author_id=author_id,
+                content=content,
+                attachment_text=attachment_text,
+                discord_message_id=discord_message_id,
+                created_at=created_at,
+            )
+        )
+    except Exception:
+        # UNIQUE constraint on discord_message_id — already stored
+        pass
+
+
+async def get_messages_page(channel_id: int, page: int = 1, page_size: int = 50,
+                            after_date: str | None = None, before_date: str | None = None) -> tuple[list[dict], int]:
+    """Get a page of messages from a channel. Returns (messages, total_count)."""
+    from sqlalchemy import func as sa_func, select
+
+    # Build where clause
+    conditions = [channel_messages.c.channel_id == channel_id]
+    if after_date:
+        conditions.append(channel_messages.c.created_at >= after_date)
+    if before_date:
+        conditions.append(channel_messages.c.created_at <= before_date)
+
+    # Count total
+    count_query = select(sa_func.count()).select_from(channel_messages)
+    for cond in conditions:
+        count_query = count_query.where(cond)
+    total = await database.fetch_val(count_query)
+
+    # Fetch page
+    query = channel_messages.select()
+    for cond in conditions:
+        query = query.where(cond)
+    query = query.order_by(channel_messages.c.created_at.asc())
+    query = query.offset((page - 1) * page_size).limit(page_size)
+    results = await database.fetch_all(query)
+
+    return [dict(row._mapping) for row in results], total
+
+
+async def search_messages_db(channel_id: int, query: str, before_context: int = 3,
+                             after_context: int = 3, max_results: int = 10) -> list[dict]:
+    """Search messages in DB by text. Returns matches with surrounding context.
+    Each result is a dict with 'match' and 'context' (list of surrounding messages)."""
+    from sqlalchemy import or_
+
+    # Find matching message IDs
+    match_query = channel_messages.select().where(
+        (channel_messages.c.channel_id == channel_id) &
+        (or_(
+            channel_messages.c.content.ilike(f"%{query}%"),
+            channel_messages.c.attachment_text.ilike(f"%{query}%"),
+        ))
+    ).order_by(channel_messages.c.created_at.asc()).limit(max_results)
+    matches = await database.fetch_all(match_query)
+
+    if not matches:
+        return []
+
+    # For each match, fetch surrounding context
+    results = []
+    for match in matches:
+        match_time = match["created_at"]
+        match_id = match["id"]
+
+        # Get before context
+        before_query = channel_messages.select().where(
+            (channel_messages.c.channel_id == channel_id) &
+            (channel_messages.c.id < match_id)
+        ).order_by(channel_messages.c.id.desc()).limit(before_context)
+        before_msgs = await database.fetch_all(before_query)
+        before_msgs = list(reversed(before_msgs))
+
+        # Get after context
+        after_query = channel_messages.select().where(
+            (channel_messages.c.channel_id == channel_id) &
+            (channel_messages.c.id > match_id)
+        ).order_by(channel_messages.c.id.asc()).limit(after_context)
+        after_msgs = await database.fetch_all(after_query)
+
+        context_msgs = (
+            [dict(m._mapping) for m in before_msgs]
+            + [dict(match._mapping)]
+            + [dict(m._mapping) for m in after_msgs]
+        )
+        results.append({
+            "match": dict(match._mapping),
+            "context": context_msgs,
+        })
+
+    return results
+
+
+async def count_channel_messages(channel_id: int) -> int:
+    """Count total messages stored for a channel."""
+    from sqlalchemy import func as sa_func, select
+    query = select(sa_func.count()).select_from(channel_messages).where(
+        channel_messages.c.channel_id == channel_id
+    )
+    return await database.fetch_val(query)
+
+
+async def get_latest_stored_message_id(channel_id: int) -> int | None:
+    """Get the discord_message_id of the most recent stored message for a channel."""
+    query = channel_messages.select().where(
+        channel_messages.c.channel_id == channel_id
+    ).order_by(channel_messages.c.created_at.desc()).limit(1)
+    result = await database.fetch_one(query)
+    return result["discord_message_id"] if result else None
+
+
+async def get_recent_messages_db(channel_id: int, limit: int = 200,
+                                 after_date: str | None = None) -> list[dict]:
+    """Get recent messages from DB for context assembly."""
+    conditions = [channel_messages.c.channel_id == channel_id]
+    if after_date:
+        conditions.append(channel_messages.c.created_at >= after_date)
+
+    query = channel_messages.select()
+    for cond in conditions:
+        query = query.where(cond)
+    query = query.order_by(channel_messages.c.created_at.desc()).limit(limit)
+    results = await database.fetch_all(query)
+    return [dict(row._mapping) for row in reversed(results)]
+
+
+# --- Memory Notes ---
+
+async def get_memory_notes(guild_id: int, user_id: int) -> str | None:
+    """Get a user's AI companion memory notes."""
+    config = await get_ai_config(guild_id, user_id)
+    return config["memory_notes"] if config else None
+
+
+async def set_memory_notes(guild_id: int, user_id: int, notes: str):
+    """Set a user's AI companion memory notes."""
+    await database.execute(
+        user_ai_config.update().where(
+            (user_ai_config.c.guild_id == guild_id) &
+            (user_ai_config.c.user_id == user_id)
+        ).values(memory_notes=notes)
     )
 
