@@ -4,6 +4,7 @@ import os
 import json
 import re
 import logging
+import aiohttp
 from datetime import datetime, timedelta, timezone
 from anthropic import Anthropic
 
@@ -243,16 +244,40 @@ def get_ai_client() -> Anthropic | None:
 
 # --- Context assembly ---
 
-def format_channel_messages(messages: list[discord.Message]) -> str:
-    """Format Discord messages into a text block for the AI."""
+TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", ".yml", ".yaml", ".toml", ".cfg", ".ini", ".sh", ".html", ".css", ".xml", ".rs", ".go", ".java", ".c", ".cpp", ".h", ".rb", ".pl"}
+MAX_ATTACHMENT_SIZE = 50_000  # 50KB limit per file to avoid blowing up context
+
+
+async def read_text_attachment(attachment: discord.Attachment) -> str | None:
+    """Download and return text content from an attachment, or None if not a text file."""
+    ext = os.path.splitext(attachment.filename)[1].lower()
+    if ext not in TEXT_EXTENSIONS:
+        return None
+    if attachment.size > MAX_ATTACHMENT_SIZE:
+        return f"[file too large: {attachment.filename} ({attachment.size} bytes)]"
+    try:
+        content_bytes = await attachment.read()
+        return content_bytes.decode("utf-8", errors="replace")
+    except Exception as e:
+        return f"[error reading {attachment.filename}: {e}]"
+
+
+async def format_channel_messages(messages: list[discord.Message]) -> str:
+    """Format Discord messages into a text block for the AI, including text file contents."""
     lines = []
     for msg in messages:
         ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
         author = msg.author.display_name
         content = msg.content or ""
         if msg.attachments:
-            att = ", ".join(f"[{a.filename}]" for a in msg.attachments)
-            content = f"{content} {att}".strip()
+            att_parts = []
+            for a in msg.attachments:
+                file_content = await read_text_attachment(a)
+                if file_content is not None:
+                    att_parts.append(f"[file: {a.filename}]\n{file_content}\n[/file: {a.filename}]")
+                else:
+                    att_parts.append(f"[attachment: {a.filename}]")
+            content = f"{content}\n{''.join(att_parts)}".strip() if att_parts else content
         if content:
             lines.append(f"[{ts}] {author}: {content}")
     return "\n".join(lines)
@@ -293,6 +318,34 @@ alongside any new ones you're adding. Review the current config above before mak
 
 # --- Tool execution ---
 
+async def _message_full_text(msg: discord.Message) -> str:
+    """Get full searchable text for a message, including text file attachments."""
+    parts = []
+    if msg.content:
+        parts.append(msg.content)
+    for a in msg.attachments:
+        file_content = await read_text_attachment(a)
+        if file_content is not None:
+            parts.append(file_content)
+    return "\n".join(parts)
+
+
+async def _format_search_message(msg: discord.Message, marker: str = "") -> str:
+    """Format a single message for search results, including file contents."""
+    ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
+    content = msg.content or "[no text]"
+    att_parts = []
+    for a in msg.attachments:
+        file_content = await read_text_attachment(a)
+        if file_content is not None:
+            att_parts.append(f"[file: {a.filename}]\n{file_content}\n[/file: {a.filename}]")
+        else:
+            att_parts.append(f"[attachment: {a.filename}]")
+    if att_parts:
+        content = f"{content}\n{''.join(att_parts)}"
+    return f"[{ts}] {msg.author.display_name}: {content}{marker}"
+
+
 async def execute_search(channel: discord.TextChannel, query: str,
                          before_context: int = 3, after_context: int = 3,
                          max_results: int = 10) -> str:
@@ -310,10 +363,11 @@ async def execute_search(channel: discord.TextChannel, query: str,
     # Reverse to chronological order
     all_messages.reverse()
 
-    # Find matching indices
+    # Find matching indices — search message text AND file contents
     match_indices = []
     for i, msg in enumerate(all_messages):
-        if msg.content and query_lower in msg.content.lower():
+        full_text = await _message_full_text(msg)
+        if query_lower in full_text.lower():
             match_indices.append(i)
             if len(match_indices) >= max_results:
                 break
@@ -331,11 +385,9 @@ async def execute_search(channel: discord.TextChannel, query: str,
         for i in range(start, end):
             if i not in seen:
                 seen.add(i)
-                msg = all_messages[i]
-                ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
                 marker = " <<< MATCH" if i == idx else ""
-                content = msg.content or "[no text]"
-                group.append(f"[{ts}] {msg.author.display_name}: {content}{marker}")
+                line = await _format_search_message(all_messages[i], marker)
+                group.append(line)
         if group:
             results.append("\n".join(group))
 
@@ -384,7 +436,7 @@ async def run_ai(guild: discord.Guild, user_id: int, channel: discord.TextChanne
     except (discord.Forbidden, discord.HTTPException) as e:
         logging.error(f"AI companion: failed to fetch history for channel {channel.id}: {e}")
 
-    history_text = format_channel_messages(history_messages) if history_messages else "(No recent messages)"
+    history_text = (await format_channel_messages(history_messages)) if history_messages else "(No recent messages)"
 
     system = build_system_message(system_prompt, wakeup_config_text)
 
