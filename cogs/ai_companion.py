@@ -959,6 +959,42 @@ class AICompanion(commands.Cog):
             trigger_info, timedelta(days=2)
         )
 
+    @discord.slash_command(name="import-messages", description="Import/reimport all message history for your personal channel")
+    async def import_messages_command(self, ctx: discord.ApplicationContext):
+        guild = ctx.guild
+        if not guild:
+            await ctx.respond("This command can only be used in a server.", ephemeral=True)
+            return
+
+        channel_id = await get_user_channel(guild.id, ctx.author.id)
+        if not channel_id:
+            await ctx.respond("You need a personal channel first.", ephemeral=True)
+            return
+        channel = guild.get_channel(channel_id)
+        if not channel:
+            await ctx.respond("Your personal channel couldn't be found.", ephemeral=True)
+            return
+
+        await ctx.defer()
+
+        # Delete all existing messages for this channel and reimport from scratch
+        from db.connection import database
+        from db.schema import channel_messages
+        await database.execute(
+            channel_messages.delete().where(channel_messages.c.channel_id == channel_id)
+        )
+
+        status_msg = await ctx.followup.send("Importing messages...")
+
+        async def progress_cb(count):
+            try:
+                await status_msg.edit(content=f"Importing messages... {count:,} so far")
+            except discord.HTTPException:
+                pass
+
+        imported = await import_channel_messages(channel, progress_callback=progress_cb)
+        await status_msg.edit(content=f"Done! Imported {imported:,} messages.")
+
     @discord.slash_command(name="ai", description="Talk to your AI companion")
     async def ai_command(self, ctx: discord.ApplicationContext):
         guild = ctx.guild
