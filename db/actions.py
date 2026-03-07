@@ -819,6 +819,15 @@ async def get_latest_stored_message_id(channel_id: int) -> int | None:
     return result["discord_message_id"] if result else None
 
 
+async def get_earliest_stored_message_id(channel_id: int) -> int | None:
+    """Get the discord_message_id of the oldest stored message for a channel."""
+    query = channel_messages.select().where(
+        channel_messages.c.channel_id == channel_id
+    ).order_by(channel_messages.c.created_at.asc()).limit(1)
+    result = await database.fetch_one(query)
+    return result["discord_message_id"] if result else None
+
+
 async def get_recent_messages_db(channel_id: int, limit: int = 200,
                                  after_date: str | None = None) -> list[dict]:
     """Get recent messages from DB for context assembly."""

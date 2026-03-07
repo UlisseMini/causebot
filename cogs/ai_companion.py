@@ -23,6 +23,7 @@ from db.actions import (
     search_messages_db,
     count_channel_messages,
     get_latest_stored_message_id,
+    get_earliest_stored_message_id,
     get_recent_messages_db,
     get_memory_notes,
     set_memory_notes,
@@ -390,24 +391,12 @@ TOOLS:
 
 # --- Discord import ---
 
-async def import_channel_messages(channel: discord.TextChannel, progress_callback=None) -> int:
-    """Import messages from Discord into the DB. Incremental — skips already-stored messages."""
-    last_id = await get_latest_stored_message_id(channel.id)
-
-    # If we have a last_id, fetch the message to get its timestamp for after=
-    after_msg = None
-    if last_id:
-        try:
-            after_msg = await channel.fetch_message(last_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            after_msg = None
-
-    count = 0
-    async for msg in channel.history(limit=None, oldest_first=True, after=after_msg):
+async def _import_batch(channel, history_iter, progress_callback, start_count=0) -> int:
+    """Import messages from a discord history iterator. Returns count of new non-bot messages."""
+    count = start_count
+    async for msg in history_iter:
         if msg.author.bot:
             continue
-
-        # Read text attachments
         att_parts = []
         for a in msg.attachments:
             ext = os.path.splitext(a.filename)[1].lower()
@@ -419,9 +408,7 @@ async def import_channel_messages(channel: discord.TextChannel, progress_callbac
                     att_parts.append(f"[attachment: {a.filename}]")
             elif a.filename:
                 att_parts.append(f"[attachment: {a.filename}]")
-
         attachment_text = "\n".join(att_parts) if att_parts else None
-
         await store_message(
             guild_id=msg.guild.id if msg.guild else 0,
             channel_id=channel.id,
@@ -432,9 +419,37 @@ async def import_channel_messages(channel: discord.TextChannel, progress_callbac
             created_at=msg.created_at.isoformat(),
         )
         count += 1
-
         if progress_callback and count % 500 == 0:
             await progress_callback(count)
+    return count
+
+
+async def import_channel_messages(channel: discord.TextChannel, progress_callback=None) -> int:
+    """Import messages from Discord into the DB. Incremental — imports before earliest and after latest stored."""
+    earliest_id = await get_earliest_stored_message_id(channel.id)
+    latest_id = await get_latest_stored_message_id(channel.id)
+
+    count = 0
+
+    if earliest_id is None:
+        # No stored messages — full import
+        count = await _import_batch(channel, channel.history(limit=None, oldest_first=True), progress_callback)
+        return count
+
+    # Phase 1: import everything BEFORE the earliest stored message
+    try:
+        earliest_msg = await channel.fetch_message(earliest_id)
+        count = await _import_batch(channel, channel.history(limit=None, oldest_first=True, before=earliest_msg), progress_callback)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
+    # Phase 2: import everything AFTER the latest stored message
+    if latest_id:
+        try:
+            latest_msg = await channel.fetch_message(latest_id)
+            count = await _import_batch(channel, channel.history(limit=None, oldest_first=True, after=latest_msg), progress_callback, start_count=count)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
 
     return count
 
