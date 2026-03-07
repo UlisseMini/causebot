@@ -644,28 +644,33 @@ class AICompanion(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """Respond when a user replies to the AI's messages in their personal channel."""
+        """Respond when a user @mentions the bot or replies to its messages."""
         if message.author.bot:
             return
         if not message.guild:
             return
 
+        triggered = False
+        trigger_info = ""
+
+        # Check for @mention
+        if self.bot.user in message.mentions:
+            triggered = True
+            # Strip the mention from the message for cleaner context
+            clean_content = message.content.replace(f"<@{self.bot.user.id}>", "").replace(f"<@!{self.bot.user.id}>", "").strip()
+            trigger_info = f"User @mentioned you in #{message.channel.name}: \"{clean_content}\""
+
         # Check if this is a reply to one of our messages
-        if not message.reference or not message.reference.message_id:
-            return
+        if not triggered and message.reference and message.reference.message_id:
+            try:
+                replied_to = await message.channel.fetch_message(message.reference.message_id)
+                if replied_to.author.id == self.bot.user.id:
+                    triggered = True
+                    trigger_info = f"User replied to your message in #{message.channel.name}: \"{message.content}\""
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
 
-        # Check if the replied-to message is from us
-        try:
-            replied_to = await message.channel.fetch_message(message.reference.message_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            return
-
-        if replied_to.author.id != self.bot.user.id:
-            return
-
-        # Check if this is in the user's personal channel
-        channel_id = await get_user_channel(message.guild.id, message.author.id)
-        if not channel_id or message.channel.id != channel_id:
+        if not triggered:
             return
 
         # Check if user has AI config
@@ -673,7 +678,7 @@ class AICompanion(commands.Cog):
         if not config or not config["enabled"]:
             return
 
-        trigger_info = f"User replied to your message: \"{message.content}\""
+        # Respond in whatever channel the interaction happened
         await run_ai(
             message.guild, message.author.id, message.channel,
             trigger_info, timedelta(days=2)
