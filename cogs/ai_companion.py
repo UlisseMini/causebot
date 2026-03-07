@@ -504,10 +504,14 @@ async def run_scan(guild_id: int, user_id: int, channel: discord.TextChannel,
 
     batches = _build_scan_batches(all_msgs)
     num_batches = len(batches)
+    show_progress = num_batches > 1
 
-    progress_msg = await channel.send(
-        f"Scanning... {_make_progress_bar(0, num_batches)} 0/{num_batches} batches | starting..."
-    )
+    if show_progress:
+        progress_msg = await channel.send(
+            f"Scanning... {_make_progress_bar(0, num_batches)} 0/{num_batches} batches | starting..."
+        )
+    else:
+        progress_msg = await channel.send("Scanning...")
 
     start_time = time.monotonic()
     memory = await get_memory_notes(guild_id, user_id) or ""
@@ -537,29 +541,26 @@ async def run_scan(guild_id: int, user_id: int, channel: discord.TextChannel,
             await channel.send(f"Error on batch {batch_num}: {e}")
             break
 
-        elapsed = time.monotonic() - start_time
-        avg_per_batch = elapsed / batch_num
-        remaining = avg_per_batch * (num_batches - batch_num)
-        eta_min = int(remaining // 60)
-        eta_sec = int(remaining % 60)
-
-        try:
-            await progress_msg.edit(
-                content=f"Scanning... {_make_progress_bar(batch_num, num_batches)} "
-                        f"{batch_num}/{num_batches} batches | "
-                        f"~{eta_min}m{eta_sec:02d}s remaining"
-            )
-        except discord.HTTPException:
-            pass
+        if show_progress:
+            elapsed = time.monotonic() - start_time
+            avg_per_batch = elapsed / batch_num
+            remaining = avg_per_batch * (num_batches - batch_num)
+            eta_min = int(remaining // 60)
+            eta_sec = int(remaining % 60)
+            try:
+                await progress_msg.edit(
+                    content=f"Scanning... {_make_progress_bar(batch_num, num_batches)} "
+                            f"{batch_num}/{num_batches} batches | "
+                            f"~{eta_min}m{eta_sec:02d}s remaining"
+                )
+            except discord.HTTPException:
+                pass
 
     total_time = time.monotonic() - start_time
     minutes = int(total_time // 60)
     seconds = int(total_time % 60)
     try:
-        await progress_msg.edit(
-            content=f"Scan complete! {_make_progress_bar(num_batches, num_batches)} "
-                    f"{num_batches}/{num_batches} batches | {minutes}m{seconds:02d}s"
-        )
+        await progress_msg.edit(content=f"Scan complete! ({minutes}m{seconds:02d}s)")
     except discord.HTTPException:
         pass
 
