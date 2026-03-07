@@ -98,6 +98,7 @@ async def main():
         bot.load_extension("cogs.claude")
         bot.load_extension("cogs.one_on_ones")
         bot.load_extension("cogs.export_msgs")
+        bot.load_extension("cogs.ai_companion")
         print("Cogs loaded")
 
         # Start the bot

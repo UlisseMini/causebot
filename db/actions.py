@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine
 from datetime import datetime, timedelta
 from db.connection import database, DATABASE_URL
-from db.schema import users, guilds, user_private_channels, user_xp, message_logs, guild_settings, reminders, one_on_one_pool, one_on_one_matches, metadata
+from db.schema import users, guilds, user_private_channels, user_xp, message_logs, guild_settings, reminders, one_on_one_pool, one_on_one_matches, user_ai_config, user_ai_wakeups, metadata
 
 
 async def get_user_channel(guild_id: int, user_id: int):
@@ -594,4 +594,104 @@ async def set_active_days(guild_id: int, days: int, guild_name: str = None):
                 active_days=days
             )
         )
+
+
+# --- AI Companion ---
+
+async def get_ai_config(guild_id: int, user_id: int) -> dict | None:
+    """Get a user's AI companion config."""
+    query = user_ai_config.select().where(
+        (user_ai_config.c.guild_id == guild_id) &
+        (user_ai_config.c.user_id == user_id)
+    )
+    result = await database.fetch_one(query)
+    if not result:
+        return None
+    return dict(result._mapping)
+
+
+async def upsert_ai_config(guild_id: int, user_id: int, system_prompt: str, enabled: bool = True):
+    """Create or update a user's AI companion config."""
+    existing = await get_ai_config(guild_id, user_id)
+    if existing:
+        await database.execute(
+            user_ai_config.update().where(
+                (user_ai_config.c.guild_id == guild_id) &
+                (user_ai_config.c.user_id == user_id)
+            ).values(system_prompt=system_prompt, enabled=1 if enabled else 0)
+        )
+    else:
+        await database.execute(
+            user_ai_config.insert().values(
+                guild_id=guild_id,
+                user_id=user_id,
+                system_prompt=system_prompt,
+                enabled=1 if enabled else 0,
+            )
+        )
+
+
+async def update_ai_system_prompt(guild_id: int, user_id: int, new_prompt: str):
+    """Update just the system prompt for a user's AI companion."""
+    await database.execute(
+        user_ai_config.update().where(
+            (user_ai_config.c.guild_id == guild_id) &
+            (user_ai_config.c.user_id == user_id)
+        ).values(system_prompt=new_prompt)
+    )
+
+
+async def get_ai_wakeups(guild_id: int, user_id: int) -> list[dict]:
+    """Get all wakeups for a user's AI companion."""
+    query = user_ai_wakeups.select().where(
+        (user_ai_wakeups.c.guild_id == guild_id) &
+        (user_ai_wakeups.c.user_id == user_id)
+    )
+    results = await database.fetch_all(query)
+    return [dict(row._mapping) for row in results]
+
+
+async def set_ai_wakeups(guild_id: int, user_id: int, wakeups: list[dict]):
+    """Replace all wakeups for a user. Each wakeup: {label, schedule, message, next_run_at}."""
+    # Delete existing
+    await database.execute(
+        user_ai_wakeups.delete().where(
+            (user_ai_wakeups.c.guild_id == guild_id) &
+            (user_ai_wakeups.c.user_id == user_id)
+        )
+    )
+    # Insert new
+    for w in wakeups:
+        await database.execute(
+            user_ai_wakeups.insert().values(
+                guild_id=guild_id,
+                user_id=user_id,
+                label=w["label"],
+                schedule=w["schedule"],
+                message=w.get("message", ""),
+                next_run_at=w.get("next_run_at"),
+                enabled=1,
+            )
+        )
+
+
+async def get_due_wakeups() -> list[dict]:
+    """Get all wakeups that are due (next_run_at <= now) and enabled."""
+    now = datetime.utcnow().isoformat()
+    query = user_ai_wakeups.select().where(
+        (user_ai_wakeups.c.next_run_at <= now) &
+        (user_ai_wakeups.c.enabled == 1) &
+        (user_ai_wakeups.c.next_run_at != None)
+    )
+    results = await database.fetch_all(query)
+    return [dict(row._mapping) for row in results]
+
+
+async def update_wakeup_next_run(wakeup_id: int, next_run_at: str):
+    """Update the next_run_at for a wakeup."""
+    await database.execute(
+        user_ai_wakeups.update().where(
+            user_ai_wakeups.c.id == wakeup_id
+        ).values(next_run_at=next_run_at)
+    )
 

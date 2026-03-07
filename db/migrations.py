@@ -89,6 +89,35 @@ def migration_007_add_active_days(conn):
         conn.execute(text("ALTER TABLE guild_settings ADD COLUMN active_days INTEGER DEFAULT 3"))
 
 
+def migration_008_create_user_ai_config(conn):
+    """Create user_ai_config table for AI companion system prompts."""
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS user_ai_config (
+            guild_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            system_prompt TEXT,
+            enabled INTEGER DEFAULT 1,
+            PRIMARY KEY (guild_id, user_id)
+        )
+    """))
+
+
+def migration_009_create_user_ai_wakeups(conn):
+    """Create user_ai_wakeups table for scheduled AI check-ins."""
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS user_ai_wakeups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            label TEXT NOT NULL,
+            schedule TEXT NOT NULL,
+            message TEXT,
+            next_run_at TEXT,
+            enabled INTEGER DEFAULT 1
+        )
+    """))
+
+
 MIGRATIONS = [
     ("001_create_guild_settings", migration_001_create_guild_settings),
     ("002_add_last_journal_message", migration_002_add_last_journal_message),
@@ -97,6 +126,8 @@ MIGRATIONS = [
     ("005_create_one_on_one_pool", migration_005_create_one_on_one_pool),
     ("006_create_one_on_one_matches", migration_006_create_one_on_one_matches),
     ("007_add_active_days", migration_007_add_active_days),
+    ("008_create_user_ai_config", migration_008_create_user_ai_config),
+    ("009_create_user_ai_wakeups", migration_009_create_user_ai_wakeups),
 ]
 
 

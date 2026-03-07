@@ -95,3 +95,25 @@ one_on_one_matches = Table(
     Column("created_at", String, server_default=func.now()),
     Column("completed_at", String, nullable=True)
 )
+
+user_ai_config = Table(
+    "user_ai_config",
+    metadata,
+    Column("guild_id", BigInteger, primary_key=True),
+    Column("user_id", BigInteger, primary_key=True),
+    Column("system_prompt", String, nullable=True),
+    Column("enabled", Integer, server_default="1"),
+)
+
+user_ai_wakeups = Table(
+    "user_ai_wakeups",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("guild_id", BigInteger, nullable=False),
+    Column("user_id", BigInteger, nullable=False),
+    Column("label", String, nullable=False),
+    Column("schedule", String, nullable=False),
+    Column("message", String, nullable=True),
+    Column("next_run_at", String, nullable=True),
+    Column("enabled", Integer, server_default="1"),
+)
