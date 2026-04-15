@@ -597,6 +597,12 @@ async def run_ai(guild: discord.Guild, user_id: int, channel: discord.TextChanne
     if not config["enabled"]:
         return
 
+    # Show typing indicator for the entire duration (context loading + API call + response)
+    async with channel.typing():
+        await _run_ai_inner(client, config, guild, user_id, channel, trigger_info, context_window)
+
+
+async def _run_ai_inner(client, config, guild, user_id, channel, trigger_info, context_window):
     system_prompt = config["system_prompt"] or DEFAULT_SYSTEM_PROMPT
     wakeups = await get_ai_wakeups(guild.id, user_id)
     wakeup_config_text = build_wakeup_config_text(wakeups)
