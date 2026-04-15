@@ -359,7 +359,8 @@ def build_wakeup_config_text(wakeups: list[dict]) -> str:
     for w in wakeups:
         status = "enabled" if w.get("enabled", 1) else "disabled"
         human_sched = schedule_to_human(w["schedule"])
-        lines.append(f"  - {w['label']}: {human_sched} ({status})")
+        channel_info = f" in <#{w['channel_id']}>" if w.get("channel_id") else ""
+        lines.append(f"  - {w['label']}: {human_sched}{channel_info} ({status})")
         if w.get("message"):
             lines.append(f"    Message: {w['message']}")
     return "\n".join(lines)
@@ -602,9 +603,8 @@ async def run_ai(guild: discord.Guild, user_id: int, channel: discord.TextChanne
         context_window = timedelta(days=2)
     after_date = (datetime.now(timezone.utc) - context_window).isoformat()
 
-    # Try DB first
-    personal_channel_id = await get_user_channel(guild.id, user_id)
-    ctx_channel_id = personal_channel_id or channel.id
+    # Load context from the channel we're actually in
+    ctx_channel_id = channel.id
     db_messages = await get_recent_messages_db(ctx_channel_id, limit=200, after_date=after_date)
 
     if db_messages:
@@ -694,8 +694,7 @@ async def _handle_tool_call(name: str, input_data: dict,
                             channel: discord.TextChannel) -> str:
     try:
         if name == "search_channel_history":
-            personal_channel_id = await get_user_channel(guild.id, user_id)
-            search_channel_id = personal_channel_id or channel.id
+            search_channel_id = channel.id
             results = await search_messages_db(
                 search_channel_id,
                 input_data["query"],
@@ -730,6 +729,7 @@ async def _handle_tool_call(name: str, input_data: dict,
                         "schedule": w["schedule"],
                         "message": w.get("message", ""),
                         "next_run_at": next_run.isoformat(),
+                        "channel_id": channel.id,
                     })
                 except ValueError as e:
                     return f"Error with schedule '{w['schedule']}': {e}"
@@ -748,8 +748,7 @@ async def _handle_tool_call(name: str, input_data: dict,
             return "Memory updated successfully."
 
         elif name == "read_messages":
-            personal_channel_id = await get_user_channel(guild.id, user_id)
-            read_channel_id = personal_channel_id or channel.id
+            read_channel_id = channel.id
             page = input_data.get("page", 1)
             page_size = min(input_data.get("page_size", 50), 200)
             messages, total = await get_messages_page(
@@ -887,10 +886,12 @@ class AICompanion(commands.Cog):
         if not guild:
             return
 
-        channel_id = await get_user_channel(guild_id, user_id)
+        # Use wakeup's stored channel_id if set, fall back to private channel
+        channel_id = wakeup.get("channel_id") or await get_user_channel(guild_id, user_id)
         if not channel_id:
             return
-        channel = guild.get_channel(channel_id)
+        # get_channel_or_thread handles both regular channels and threads
+        channel = guild.get_channel_or_thread(channel_id)
         if not channel:
             return
 

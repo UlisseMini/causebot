@@ -117,6 +117,7 @@ user_ai_wakeups = Table(
     Column("message", String, nullable=True),
     Column("next_run_at", String, nullable=True),
     Column("enabled", Integer, server_default="1"),
+    Column("channel_id", BigInteger, nullable=True),
 )
 
 channel_messages = Table(

@@ -148,6 +148,12 @@ def migration_011_add_memory_notes(conn):
         conn.execute(text("ALTER TABLE user_ai_config ADD COLUMN memory_notes TEXT"))
 
 
+def migration_012_add_wakeup_channel_id(conn):
+    """Add channel_id column to user_ai_wakeups so wakeups can fire in specific channels/threads."""
+    if not _column_exists(conn, "user_ai_wakeups", "channel_id"):
+        conn.execute(text("ALTER TABLE user_ai_wakeups ADD COLUMN channel_id BIGINT"))
+
+
 MIGRATIONS = [
     ("001_create_guild_settings", migration_001_create_guild_settings),
     ("002_add_last_journal_message", migration_002_add_last_journal_message),
@@ -160,6 +166,7 @@ MIGRATIONS = [
     ("009_create_user_ai_wakeups", migration_009_create_user_ai_wakeups),
     ("010_create_channel_messages", migration_010_create_channel_messages),
     ("011_add_memory_notes", migration_011_add_memory_notes),
+    ("012_add_wakeup_channel_id", migration_012_add_wakeup_channel_id),
 ]
 
 

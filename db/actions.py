@@ -671,6 +671,7 @@ async def set_ai_wakeups(guild_id: int, user_id: int, wakeups: list[dict]):
                 message=w.get("message", ""),
                 next_run_at=w.get("next_run_at"),
                 enabled=1,
+                channel_id=w.get("channel_id"),
             )
         )
 
