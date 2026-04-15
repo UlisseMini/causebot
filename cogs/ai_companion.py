@@ -338,7 +338,7 @@ def get_ai_client() -> Anthropic | None:
 
 # --- Context assembly ---
 
-def format_db_messages(messages: list[dict]) -> str:
+def format_db_messages(messages: list[dict], bot_user_id: int | None = None) -> str:
     """Format messages from DB into text for the AI."""
     lines = []
     for msg in messages:
@@ -348,7 +348,9 @@ def format_db_messages(messages: list[dict]) -> str:
         if att:
             content = f"{content}\n{att}".strip()
         if content:
-            lines.append(f"[{ts}] (user {msg['author_id']}): {content}")
+            author_id = msg["author_id"]
+            label = "you (bot)" if bot_user_id and author_id == bot_user_id else f"user {author_id}"
+            lines.append(f"[{ts}] ({label}): {content}")
     return "\n".join(lines) if lines else "(No messages)"
 
 
@@ -400,11 +402,9 @@ TOOLS:
 # --- Discord import ---
 
 async def _import_batch(channel, history_iter, progress_callback, start_count=0) -> int:
-    """Import messages from a discord history iterator. Returns count of new non-bot messages."""
+    """Import messages from a discord history iterator. Returns count of new messages."""
     count = start_count
     async for msg in history_iter:
-        if msg.author.bot:
-            continue
         att_parts = []
         for a in msg.attachments:
             ext = os.path.splitext(a.filename)[1].lower()
@@ -607,8 +607,9 @@ async def run_ai(guild: discord.Guild, user_id: int, channel: discord.TextChanne
     ctx_channel_id = channel.id
     db_messages = await get_recent_messages_db(ctx_channel_id, limit=200, after_date=after_date)
 
+    bot_user_id = guild.me.id if guild.me else None
     if db_messages:
-        history_text = format_db_messages(db_messages)
+        history_text = format_db_messages(db_messages, bot_user_id=bot_user_id)
     else:
         # Fall back to Discord API
         history_messages = []
@@ -921,29 +922,28 @@ class AICompanion(commands.Cog):
         if not message.guild:
             return
 
-        # Store every non-bot message in DB
-        if not message.author.bot:
-            att_parts = []
-            for a in message.attachments:
-                ext = os.path.splitext(a.filename)[1].lower()
-                if ext in TEXT_EXTENSIONS and a.size <= MAX_ATTACHMENT_SIZE:
-                    try:
-                        content_bytes = await a.read()
-                        att_parts.append(f"[file: {a.filename}]\n{content_bytes.decode('utf-8', errors='replace')}\n[/file: {a.filename}]")
-                    except Exception:
-                        att_parts.append(f"[attachment: {a.filename}]")
-                elif a.filename:
+        # Store every message (including bot messages) so context is complete
+        att_parts = []
+        for a in message.attachments:
+            ext = os.path.splitext(a.filename)[1].lower()
+            if ext in TEXT_EXTENSIONS and a.size <= MAX_ATTACHMENT_SIZE:
+                try:
+                    content_bytes = await a.read()
+                    att_parts.append(f"[file: {a.filename}]\n{content_bytes.decode('utf-8', errors='replace')}\n[/file: {a.filename}]")
+                except Exception:
                     att_parts.append(f"[attachment: {a.filename}]")
+            elif a.filename:
+                att_parts.append(f"[attachment: {a.filename}]")
 
-            await store_message(
-                guild_id=message.guild.id,
-                channel_id=message.channel.id,
-                author_id=message.author.id,
-                content=message.content,
-                attachment_text="\n".join(att_parts) if att_parts else None,
-                discord_message_id=message.id,
-                created_at=message.created_at.isoformat(),
-            )
+        await store_message(
+            guild_id=message.guild.id,
+            channel_id=message.channel.id,
+            author_id=message.author.id,
+            content=message.content,
+            attachment_text="\n".join(att_parts) if att_parts else None,
+            discord_message_id=message.id,
+            created_at=message.created_at.isoformat(),
+        )
 
         if message.author.bot:
             return
