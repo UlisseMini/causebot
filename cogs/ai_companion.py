@@ -390,12 +390,16 @@ CONFIGURATION:
 {wakeup_config_text}
 
 ---
+IMPORTANT: Recent channel messages are provided below in the conversation. You already have them.
+Do NOT use search_channel_history or read_messages to re-read recent context — just look at what's given to you.
+Only use those tools if you need to search for something specific further back in history.
+
 TOOLS:
-- search_channel_history: Search stored messages by text
+- search_channel_history: Search stored messages by text (for older messages not in your context)
 - set_wakeups: Manage scheduled check-ins (REPLACES all — include ones to keep)
 - update_system_prompt: Edit your own system prompt
 - update_memory: Update your persistent memory notes about this user
-- read_messages: Browse stored message history in pages
+- read_messages: Browse stored message history in pages (for older messages not in your context)
 - start_scan: Bulk scan + distill message history into memory (preview first, then confirm)"""
 
 
@@ -654,6 +658,22 @@ async def run_ai(guild: discord.Guild, user_id: int, channel: discord.TextChanne
         except (discord.Forbidden, discord.HTTPException) as e:
             logging.error(f"AI companion: failed to fetch history from Discord: {e}")
 
+    # For threads, fetch the starter message (it lives in the parent channel, not the thread)
+    thread_starter_text = ""
+    if isinstance(channel, discord.Thread) and channel.parent:
+        try:
+            starter_msg = await channel.parent.fetch_message(channel.id)
+            ts = starter_msg.created_at.strftime("%Y-%m-%d %H:%M")
+            author_label = "you (bot)" if bot_user_id and starter_msg.author.id == bot_user_id else f"user {starter_msg.author.id}"
+            content = starter_msg.content or ""
+            if starter_msg.attachments:
+                att_info = ", ".join([f"[{a.filename}]" for a in starter_msg.attachments])
+                content = f"{content} {att_info}".strip()
+            if content:
+                thread_starter_text = f"THREAD STARTER MESSAGE:\n[{ts}] ({author_label}): {content}\n\n"
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
     if db_messages:
         history_text = format_db_messages(db_messages, bot_user_id=bot_user_id)
     else:
@@ -663,7 +683,7 @@ async def run_ai(guild: discord.Guild, user_id: int, channel: discord.TextChanne
 
     user_message = f"""TRIGGER: {trigger_info}
 
-RECENT CHANNEL MESSAGES:
+{thread_starter_text}RECENT CHANNEL MESSAGES (you already have these — do NOT use tools to re-read them):
 {history_text}"""
 
     messages = [{"role": "user", "content": user_message}]
