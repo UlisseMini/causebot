@@ -598,38 +598,66 @@ async def run_ai(guild: discord.Guild, user_id: int, channel: discord.TextChanne
     wakeup_config_text = build_wakeup_config_text(wakeups)
     memory = config.get("memory_notes") or "(No memory notes yet. Use update_memory to start building knowledge about this user.)"
 
-    # Fetch recent context from DB, fall back to Discord
+    # Fetch recent context — always ensure at least MIN_CONTEXT messages
+    MIN_CONTEXT = 20
+    MAX_CONTEXT = 200
     if context_window is None:
         context_window = timedelta(days=2)
     after_date = (datetime.now(timezone.utc) - context_window).isoformat()
 
-    # Load context from the channel we're actually in
     ctx_channel_id = channel.id
-    db_messages = await get_recent_messages_db(ctx_channel_id, limit=200, after_date=after_date)
-
     bot_user_id = guild.me.id if guild.me else None
+
+    # First try DB with time window
+    db_messages = await get_recent_messages_db(ctx_channel_id, limit=MAX_CONTEXT, after_date=after_date)
+
+    # If DB has fewer than minimum, try DB without time window to get more
+    if len(db_messages) < MIN_CONTEXT:
+        db_messages = await get_recent_messages_db(ctx_channel_id, limit=MAX_CONTEXT)
+
+    # If DB still has fewer than minimum, pull from Discord API and store
+    if len(db_messages) < MIN_CONTEXT:
+        try:
+            discord_msgs = []
+            async for msg in channel.history(limit=MAX_CONTEXT, oldest_first=False):
+                discord_msgs.append(msg)
+            discord_msgs.reverse()  # oldest first
+
+            # Store any messages not already in DB (fills gaps)
+            for msg in discord_msgs:
+                try:
+                    att_parts = []
+                    for a in msg.attachments:
+                        ext = os.path.splitext(a.filename)[1].lower()
+                        if ext in TEXT_EXTENSIONS and a.size <= MAX_ATTACHMENT_SIZE:
+                            try:
+                                content_bytes = await a.read()
+                                att_parts.append(f"[file: {a.filename}]\n{content_bytes.decode('utf-8', errors='replace')}\n[/file: {a.filename}]")
+                            except Exception:
+                                att_parts.append(f"[attachment: {a.filename}]")
+                        elif a.filename:
+                            att_parts.append(f"[attachment: {a.filename}]")
+                    await store_message(
+                        guild_id=guild.id,
+                        channel_id=channel.id,
+                        author_id=msg.author.id,
+                        content=msg.content,
+                        attachment_text="\n".join(att_parts) if att_parts else None,
+                        discord_message_id=msg.id,
+                        created_at=msg.created_at.isoformat(),
+                    )
+                except Exception:
+                    pass  # duplicate discord_message_id, already stored
+
+            # Re-read from DB now that gaps are filled
+            db_messages = await get_recent_messages_db(ctx_channel_id, limit=MAX_CONTEXT)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            logging.error(f"AI companion: failed to fetch history from Discord: {e}")
+
     if db_messages:
         history_text = format_db_messages(db_messages, bot_user_id=bot_user_id)
     else:
-        # Fall back to Discord API
-        history_messages = []
-        after_time = datetime.now(timezone.utc) - context_window
-        try:
-            async for msg in channel.history(after=after_time, oldest_first=True, limit=200):
-                history_messages.append(msg)
-        except (discord.Forbidden, discord.HTTPException) as e:
-            logging.error(f"AI companion: failed to fetch history: {e}")
-
-        if history_messages:
-            lines = []
-            for msg in history_messages:
-                ts = msg.created_at.strftime("%Y-%m-%d %H:%M")
-                content = msg.content or ""
-                if content:
-                    lines.append(f"[{ts}] {msg.author.display_name}: {content}")
-            history_text = "\n".join(lines)
-        else:
-            history_text = "(No recent messages)"
+        history_text = "(No recent messages)"
 
     system = build_system_message(system_prompt, wakeup_config_text, memory)
 
