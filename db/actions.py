@@ -720,6 +720,16 @@ async def store_message(guild_id: int, channel_id: int, author_id: int,
         pass
 
 
+async def update_message_content(discord_message_id: int, content: str | None,
+                                 attachment_text: str | None):
+    """Update content + attachment_text for a stored message (used on edits)."""
+    await database.execute(
+        channel_messages.update()
+        .where(channel_messages.c.discord_message_id == discord_message_id)
+        .values(content=content, attachment_text=attachment_text)
+    )
+
+
 async def get_messages_page(channel_id: int, page: int = 1, page_size: int = 50,
                             after_date: str | None = None, before_date: str | None = None) -> tuple[list[dict], int]:
     """Get a page of messages from a channel. Returns (messages, total_count)."""

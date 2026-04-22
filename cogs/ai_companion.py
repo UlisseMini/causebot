@@ -19,6 +19,7 @@ from db.actions import (
     update_wakeup_next_run,
     get_user_channel,
     store_message,
+    update_message_content,
     get_messages_page,
     search_messages_db,
     count_channel_messages,
@@ -405,28 +406,32 @@ TOOLS:
 
 # --- Discord import ---
 
+async def extract_attachment_text(message: discord.Message) -> str | None:
+    """Pull text from readable attachments. Returns None if none present."""
+    parts = []
+    for a in message.attachments:
+        ext = os.path.splitext(a.filename)[1].lower()
+        if ext in TEXT_EXTENSIONS and a.size <= MAX_ATTACHMENT_SIZE:
+            try:
+                content_bytes = await a.read()
+                parts.append(f"[file: {a.filename}]\n{content_bytes.decode('utf-8', errors='replace')}\n[/file: {a.filename}]")
+            except Exception:
+                parts.append(f"[attachment: {a.filename}]")
+        elif a.filename:
+            parts.append(f"[attachment: {a.filename}]")
+    return "\n".join(parts) if parts else None
+
+
 async def _import_batch(channel, history_iter, progress_callback, start_count=0) -> int:
     """Import messages from a discord history iterator. Returns count of new messages."""
     count = start_count
     async for msg in history_iter:
-        att_parts = []
-        for a in msg.attachments:
-            ext = os.path.splitext(a.filename)[1].lower()
-            if ext in TEXT_EXTENSIONS and a.size <= MAX_ATTACHMENT_SIZE:
-                try:
-                    content_bytes = await a.read()
-                    att_parts.append(f"[file: {a.filename}]\n{content_bytes.decode('utf-8', errors='replace')}\n[/file: {a.filename}]")
-                except Exception:
-                    att_parts.append(f"[attachment: {a.filename}]")
-            elif a.filename:
-                att_parts.append(f"[attachment: {a.filename}]")
-        attachment_text = "\n".join(att_parts) if att_parts else None
         await store_message(
             guild_id=msg.guild.id if msg.guild else 0,
             channel_id=channel.id,
             author_id=msg.author.id,
             content=msg.content,
-            attachment_text=attachment_text,
+            attachment_text=await extract_attachment_text(msg),
             discord_message_id=msg.id,
             created_at=msg.created_at.isoformat(),
         )
@@ -977,24 +982,12 @@ class AICompanion(commands.Cog):
             return
 
         # Store every message (including bot messages) so context is complete
-        att_parts = []
-        for a in message.attachments:
-            ext = os.path.splitext(a.filename)[1].lower()
-            if ext in TEXT_EXTENSIONS and a.size <= MAX_ATTACHMENT_SIZE:
-                try:
-                    content_bytes = await a.read()
-                    att_parts.append(f"[file: {a.filename}]\n{content_bytes.decode('utf-8', errors='replace')}\n[/file: {a.filename}]")
-                except Exception:
-                    att_parts.append(f"[attachment: {a.filename}]")
-            elif a.filename:
-                att_parts.append(f"[attachment: {a.filename}]")
-
         await store_message(
             guild_id=message.guild.id,
             channel_id=message.channel.id,
             author_id=message.author.id,
             content=message.content,
-            attachment_text="\n".join(att_parts) if att_parts else None,
+            attachment_text=await extract_attachment_text(message),
             discord_message_id=message.id,
             created_at=message.created_at.isoformat(),
         )
@@ -1031,6 +1024,17 @@ class AICompanion(commands.Cog):
         await run_ai(
             message.guild, message.author.id, message.channel,
             trigger_info, timedelta(days=2)
+        )
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        """Keep stored content in sync when users edit messages."""
+        if not after.guild:
+            return
+        await update_message_content(
+            discord_message_id=after.id,
+            content=after.content,
+            attachment_text=await extract_attachment_text(after),
         )
 
     @discord.slash_command(name="import-messages", description="Import/reimport all message history for your personal channel")
