@@ -780,16 +780,22 @@ async def _handle_tool_call(name: str, input_data: dict,
 
         elif name == "set_wakeups":
             now = datetime.now(timezone.utc)
+            existing_by_label = {w["label"]: w for w in await get_ai_wakeups(guild.id, user_id)}
             wakeups_to_store = []
             for w in input_data["wakeups"]:
                 try:
                     next_run = compute_next_run(w["schedule"], after=now)
+                    # Preserve channel_id from existing wakeup with same label — wakeups
+                    # should fire where they were originally scheduled, not wherever
+                    # the AI happens to be when it re-saves the config.
+                    prior = existing_by_label.get(w["label"])
+                    wakeup_channel_id = prior["channel_id"] if prior and prior.get("channel_id") else channel.id
                     wakeups_to_store.append({
                         "label": w["label"],
                         "schedule": w["schedule"],
                         "message": w.get("message", ""),
                         "next_run_at": next_run.isoformat(),
-                        "channel_id": channel.id,
+                        "channel_id": wakeup_channel_id,
                     })
                 except ValueError as e:
                     return f"Error with schedule '{w['schedule']}': {e}"
@@ -946,13 +952,17 @@ class AICompanion(commands.Cog):
         if not guild:
             return
 
-        # Use wakeup's stored channel_id if set, fall back to private channel
-        channel_id = wakeup.get("channel_id") or await get_user_channel(guild_id, user_id)
+        # Wakeups fire only in the channel/thread where they were scheduled.
+        # Old rows without channel_id are skipped rather than silently falling
+        # back to the private channel.
+        channel_id = wakeup.get("channel_id")
         if not channel_id:
+            logging.warning(f"AI companion: wakeup {wakeup['id']} ({wakeup['label']}) has no channel_id, skipping")
             return
         # get_channel_or_thread handles both regular channels and threads
         channel = guild.get_channel_or_thread(channel_id)
         if not channel:
+            logging.warning(f"AI companion: wakeup {wakeup['id']} ({wakeup['label']}) channel {channel_id} not found, skipping")
             return
 
         interval = interval_to_timedelta(wakeup["schedule"])
